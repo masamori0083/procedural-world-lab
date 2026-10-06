@@ -1,0 +1,20 @@
+/target/
+/captures/
+/reports/
+.DS_Store
+
+/publish/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Keep models and internal working documents local.
+/assets/models/
+/docs/
+/PROJECT_CONTEXT.md
+/AGENTS.md
+/.agents/
+/.codex/
+/scripts/export_source.py
