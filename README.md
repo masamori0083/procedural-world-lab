@@ -19,7 +19,7 @@ Animal models are not included. Place these files in `assets/models/`:
 - `Alpaca.gltf`
 - `Wolf.gltf`
 
-Use self-contained glTF files with embedded buffers and textures. See [asset details](assets/README.md) for the model manifest and source information.
+Use self-contained glTF files with embedded buffers and textures. See [asset details](assets/README.md) for setup and source information.
 
 ## Run
 
@@ -90,7 +90,6 @@ cargo run --locked -- --seed 42 --stream-smoke-test
 ```text
 src/                         Terrain, rivers, vegetation, horse controls, and rendering
 assets/models/               Locally supplied animal models
-assets/model-manifest.json   Model filenames and checksums
 assets/README.md             Asset setup and source details
 Cargo.toml                   Rust package and dependencies
 Cargo.lock                   Locked dependency versions

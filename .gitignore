@@ -18,3 +18,4 @@
 /.agents/
 /.codex/
 /scripts/export_source.py
+/assets/model-manifest.json
