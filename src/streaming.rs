@@ -3,6 +3,7 @@ use crate::{
     environment::{EnvironmentSample, MapLayer},
     player::HorseController,
     terrain::{CELL, Landform, Meadow, SeedRandom, TerrainSettings},
+    terrain_lod::{self, Detail as TerrainDetail},
     trees::{TreeSettings, TreeShape},
     vegetation::{self, Blueprint, Levels},
     world::{Grass, TerrainSurface},
@@ -20,7 +21,7 @@ use std::{
     time::Instant,
 };
 
-pub const VERSION: u32 = 12;
+pub const VERSION: u32 = 13;
 pub const CHUNK_SIZE: f32 = 96.0;
 pub const RADIUS: i32 = 3;
 pub const MAX_CHUNKS: usize = ((RADIUS * 2 + 1) * (RADIUS * 2 + 1)) as usize;
@@ -309,6 +310,8 @@ impl ChunkSurface {
 }
 struct ChunkData {
     surface: Mesh,
+    surface_detail: TerrainDetail,
+    surface_bytes: usize,
     stones: Mesh,
     water: Mesh,
     lake: Mesh,
@@ -365,13 +368,14 @@ impl Batch {
 }
 #[cfg(test)]
 fn generate(generator: Generator, key: ChunkKey, settings: TreeSettings) -> ChunkData {
-    generate_at(generator, key, settings, None)
+    generate_at(generator, key, settings, None, TerrainDetail::Near)
 }
 fn generate_at(
     generator: Generator,
     key: ChunkKey,
     settings: TreeSettings,
     view: Option<vegetation::View>,
+    surface_detail: TerrainDetail,
 ) -> ChunkData {
     let start = Instant::now();
     let origin = key.origin();
@@ -383,7 +387,6 @@ fn generate_at(
     let mut normals = Vec::new();
     let mut samples = Vec::new();
     let mut patches = Vec::new();
-    let mut indices = Vec::new();
     for z in 0..SIDE {
         for x in 0..SIDE {
             let p = origin + Vec2::new(x as f32, z as f32) * CELL;
@@ -395,24 +398,10 @@ fn generate_at(
             normals.push(Vec3::new(-dx, 2. * CELL, -dz).normalize().to_array());
             samples.push(generator.habitat(p));
             patches.push(generator.noise(p * 0.08));
-            if x < SIDE - 1 && z < SIDE - 1 {
-                let a = (z * SIDE + x) as u32;
-                let c = a + SIDE as u32;
-                indices.extend([a, c, a + 1, a + 1, c, c + 1]);
-            }
         }
     }
     let (water, lake) = water_meshes(&generator, origin, &positions);
     let water_vertices = water.count_vertices() + lake.count_vertices();
-    let colors = ChunkSurface { samples, patches };
-    let surface = Mesh::new(
-        PrimitiveTopology::TriangleList,
-        RenderAssetUsages::default(),
-    )
-    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
-    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors.colors(MapLayer::Natural))
-    .with_inserted_indices(Indices::U32(indices));
     let neighbours = generator.tree_neighbours(key);
     let trees: Vec<_> = neighbours
         .iter()
@@ -498,26 +487,151 @@ fn generate_at(
     });
     let built = vegetation.build(vegetation.levels(view, None));
     let stones = ford_stone_mesh(&ford_stones(&generator, key), origin);
-    let bytes = SIDE * SIDE * 40
-        + (SIDE - 1) * (SIDE - 1) * 6 * 4
+    let ground = simplify_surface(
+        &generator,
+        key,
+        surface_detail,
+        &trees,
+        positions,
+        normals,
+        samples,
+        patches,
+    );
+    let bytes = ground.bytes
         + built.vertices * 40
         + vegetation.bytes()
         + water_vertices * 48
         + stones.count_vertices() * 40;
     ChunkData {
-        surface,
+        surface: ground.mesh,
+        surface_detail,
+        surface_bytes: ground.bytes,
         stones,
         water,
         lake,
         water_vertices,
         vegetation,
         built,
-        colors,
+        colors: ground.colors,
         trees,
         obstacles,
         elapsed_ms: start.elapsed().as_secs_f64() * 1000.,
         bytes,
     }
+}
+
+struct SurfaceBuilt {
+    mesh: Mesh,
+    colors: ChunkSurface,
+    detail: TerrainDetail,
+    bytes: usize,
+    elapsed_ms: f64,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn simplify_surface(
+    g: &Generator,
+    key: ChunkKey,
+    detail: TerrainDetail,
+    trees: &[(Vec2, f32)],
+    positions: Vec<[f32; 3]>,
+    normals: Vec<[f32; 3]>,
+    samples: Vec<EnvironmentSample>,
+    patches: Vec<f32>,
+) -> SurfaceBuilt {
+    let start = Instant::now();
+    let heights: Vec<_> = positions.iter().map(|p| p[1]).collect();
+    let protected: Vec<_> = positions
+        .iter()
+        .map(|p| {
+            if detail == TerrainDetail::Near {
+                return false;
+            }
+            let p = key.origin() + Vec2::new(p[0], p[2]);
+            let water = g.water(p);
+            water.distance <= water.width + 12.
+                || trees
+                    .iter()
+                    .any(|(tree, _)| (p - *tree).abs().max_element() <= CELL)
+        })
+        .collect();
+    let full_indices = terrain_lod::indices(&heights, &protected, SIDE, detail);
+    let mut remap = BTreeMap::new();
+    let mut selected = if detail == TerrainDetail::Near {
+        (0..positions.len()).collect()
+    } else {
+        Vec::new()
+    };
+    let indices: Vec<u32> = full_indices
+        .into_iter()
+        .map(|index| {
+            if detail == TerrainDetail::Near {
+                return index;
+            }
+            *remap.entry(index).or_insert_with(|| {
+                let next = selected.len() as u32;
+                selected.push(index as usize);
+                next
+            })
+        })
+        .collect();
+    let colors = ChunkSurface {
+        samples: selected.iter().map(|i| samples[*i]).collect(),
+        patches: selected.iter().map(|i| patches[*i]).collect(),
+    };
+    let bytes = selected.len() * (40 + size_of::<EnvironmentSample>() + size_of::<f32>())
+        + indices.len() * 4;
+    let mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    )
+    .with_inserted_attribute(
+        Mesh::ATTRIBUTE_POSITION,
+        selected.iter().map(|i| positions[*i]).collect::<Vec<_>>(),
+    )
+    .with_inserted_attribute(
+        Mesh::ATTRIBUTE_NORMAL,
+        selected.iter().map(|i| normals[*i]).collect::<Vec<_>>(),
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors.colors(MapLayer::Natural))
+    .with_inserted_indices(Indices::U32(indices));
+    SurfaceBuilt {
+        mesh,
+        colors,
+        detail,
+        bytes,
+        elapsed_ms: start.elapsed().as_secs_f64() * 1000.,
+    }
+}
+
+fn rebuild_surface(
+    g: &Generator,
+    key: ChunkKey,
+    detail: TerrainDetail,
+    trees: &[(Vec2, f32)],
+) -> SurfaceBuilt {
+    let start = Instant::now();
+    for region in tree_regions(key) {
+        g.hydrology.prepare(g, region);
+    }
+    let mut positions = Vec::new();
+    let mut normals = Vec::new();
+    let mut samples = Vec::new();
+    let mut patches = Vec::new();
+    for z in 0..SIDE {
+        for x in 0..SIDE {
+            let p = key.origin() + Vec2::new(x as f32, z as f32) * CELL;
+            positions.push([x as f32 * CELL, g.height(p), z as f32 * CELL]);
+            let dx = g.height(p + Vec2::X * CELL) - g.height(p - Vec2::X * CELL);
+            let dz = g.height(p + Vec2::Y * CELL) - g.height(p - Vec2::Y * CELL);
+            normals.push(Vec3::new(-dx, 2. * CELL, -dz).normalize().to_array());
+            samples.push(g.habitat(p));
+            patches.push(g.noise(p * 0.08));
+        }
+    }
+    let mut built = simplify_surface(g, key, detail, trees, positions, normals, samples, patches);
+    built.elapsed_ms = start.elapsed().as_secs_f64() * 1000.;
+    built
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -724,6 +838,11 @@ fn make_water_mesh(g: &Generator, origin: Vec2, vertices: Vec<(Vec3, Vec2)>) -> 
 
 struct Resident {
     root: Entity,
+    surface_entity: Entity,
+    surface_mesh: AssetId<Mesh>,
+    surface_detail: TerrainDetail,
+    surface_bytes: usize,
+    surface_triangles: usize,
     tree_entity: Entity,
     grass_entity: Entity,
     vegetation: Arc<Blueprint>,
@@ -744,6 +863,10 @@ pub struct StreamWorld {
     loaded: BTreeMap<ChunkKey, Resident>,
     pending: BTreeMap<ChunkKey, Task<ChunkData>>,
     pending_lod: BTreeMap<ChunkKey, Task<vegetation::Built>>,
+    pending_surface: BTreeMap<ChunkKey, Task<SurfaceBuilt>>,
+    terrain_lod_enabled: bool,
+    pub terrain_rebuilt: u64,
+    pub last_terrain_ms: f64,
     lod_enabled: bool,
     installed_this_frame: bool,
     pub lod_rebuilt: u64,
@@ -812,7 +935,20 @@ impl StreamWorld {
         self.loaded.len()
     }
     pub fn pending_count(&self) -> usize {
-        self.pending.len() + self.pending_lod.len()
+        self.pending.len() + self.pending_lod.len() + self.pending_surface.len()
+    }
+    pub fn terrain_lod_counts(&self) -> [usize; 3] {
+        let mut counts = [0; 3];
+        for chunk in self.loaded.values() {
+            counts[chunk.surface_detail.index()] += 1;
+        }
+        counts
+    }
+    pub fn terrain_triangles(&self) -> (usize, usize) {
+        (
+            self.loaded.values().map(|c| c.surface_triangles).sum(),
+            self.loaded.len() * (SIDE - 1) * (SIDE - 1) * 2,
+        )
     }
     pub fn lod_counts(&self) -> ([usize; 3], [usize; 3]) {
         let mut trees = [0; 3];
@@ -872,6 +1008,7 @@ pub fn setup(
     world: Res<Meadow>,
     settings: Res<TreeSettings>,
     config: Res<vegetation::LodConfig>,
+    terrain_config: Res<terrain_lod::Config>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     river: Option<Res<crate::water::RiverMaterial>>,
 ) {
@@ -885,6 +1022,10 @@ pub fn setup(
         loaded: BTreeMap::new(),
         pending: BTreeMap::new(),
         pending_lod: BTreeMap::new(),
+        pending_surface: BTreeMap::new(),
+        terrain_lod_enabled: terrain_config.enabled,
+        terrain_rebuilt: 0,
+        last_terrain_ms: 0.,
         lod_enabled: config.enabled,
         installed_this_frame: false,
         lod_rebuilt: 0,
@@ -983,6 +1124,7 @@ pub fn update(
             data.surface
                 .insert_attribute(Mesh::ATTRIBUTE_COLOR, data.colors.colors(*layer));
             let surface = meshes.add(data.surface);
+            let surface_triangles = meshes.get(&surface).unwrap().indices().unwrap().len() / 3;
             let trees =
                 (data.built.trees.count_vertices() > 0).then(|| meshes.add(data.built.trees));
             let grass =
@@ -1011,6 +1153,7 @@ pub fn update(
             );
             let origin = key.origin();
             let mut tree_entity = Entity::PLACEHOLDER;
+            let mut surface_entity = Entity::PLACEHOLDER;
             let mut grass_entity = Entity::PLACEHOLDER;
             let root = commands
                 .spawn((
@@ -1026,12 +1169,14 @@ pub fn update(
                             MeshMaterial3d(stream.trees_material.clone()),
                         ));
                     }
-                    root.spawn((
-                        TerrainSurface,
-                        data.colors,
-                        Mesh3d(surface.clone()),
-                        MeshMaterial3d(stream.terrain_material.clone()),
-                    ));
+                    surface_entity = root
+                        .spawn((
+                            TerrainSurface,
+                            data.colors,
+                            Mesh3d(surface.clone()),
+                            MeshMaterial3d(stream.terrain_material.clone()),
+                        ))
+                        .id();
                     let mut entity = root.spawn((
                         Transform::default(),
                         Visibility::Inherited,
@@ -1075,6 +1220,11 @@ pub fn update(
                 key,
                 Resident {
                     root,
+                    surface_entity,
+                    surface_mesh: surface.id(),
+                    surface_detail: data.surface_detail,
+                    surface_bytes: data.surface_bytes,
+                    surface_triangles,
                     tree_entity,
                     grass_entity,
                     vegetation: data.vegetation,
@@ -1098,6 +1248,7 @@ pub fn update(
     }
     let mut keep = BTreeSet::from([crate::watershed::key(Vec2::ZERO)]);
     keep.extend(stream.pending.keys().flat_map(|k| tree_regions(*k)));
+    keep.extend(stream.pending_surface.keys().flat_map(|k| tree_regions(*k)));
     let mut wanted = Vec::new();
     for z in center.1 - RADIUS..=center.1 + RADIUS {
         for x in center.0 - RADIUS..=center.0 + RADIUS {
@@ -1121,10 +1272,102 @@ pub fn update(
     {
         let generator = stream.generator.clone();
         let settings = stream.settings;
+        let detail = if stream.terrain_lod_enabled {
+            TerrainDetail::choose(key.origin(), p, None)
+        } else {
+            TerrainDetail::Near
+        };
         stream.pending.insert(
             key,
             AsyncComputeTaskPool::get()
-                .spawn(async move { generate_at(generator, key, settings, view) }),
+                .spawn(async move { generate_at(generator, key, settings, view, detail) }),
+        );
+    }
+}
+
+/// Terrain refinements share the same two-worker budget and one-install limit.
+pub fn update_terrain_lod(
+    mut commands: Commands,
+    stream: Option<ResMut<StreamWorld>>,
+    horse: Single<&Transform, With<HorseController>>,
+    layer: Res<MapLayer>,
+    mut meshes: ResMut<Assets<Mesh>>,
+) {
+    let Some(mut stream) = stream else {
+        return;
+    };
+    let p = Vec2::new(horse.translation.x, horse.translation.z);
+    let keys: Vec<_> = stream.pending_surface.keys().copied().collect();
+    for key in keys {
+        let target = stream.loaded.get(&key).map(|chunk| {
+            if stream.terrain_lod_enabled {
+                TerrainDetail::choose(key.origin(), p, Some(chunk.surface_detail))
+            } else {
+                TerrainDetail::Near
+            }
+        });
+        // Evicted workers remain in the two-task budget until they finish.
+        if target.is_some() && stream.installed_this_frame {
+            continue;
+        }
+        let Some(mut built) = block_on(poll_once(stream.pending_surface.get_mut(&key).unwrap()))
+        else {
+            continue;
+        };
+        stream.pending_surface.remove(&key);
+        let Some(chunk) = stream.loaded.get_mut(&key) else {
+            continue;
+        };
+        if Some(built.detail) != target {
+            continue;
+        }
+        built
+            .mesh
+            .insert_attribute(Mesh::ATTRIBUTE_COLOR, built.colors.colors(*layer));
+        let triangles = built.mesh.indices().unwrap().len() / 3;
+        let surface = meshes.add(built.mesh);
+        commands
+            .entity(chunk.surface_entity)
+            .insert((Mesh3d(surface.clone()), built.colors));
+        meshes.remove(chunk.surface_mesh);
+        chunk.meshes.retain(|id| *id != chunk.surface_mesh);
+        chunk.surface_mesh = surface.id();
+        chunk.meshes.push(surface.id());
+        chunk.bytes = chunk.bytes - chunk.surface_bytes + built.bytes;
+        chunk.surface_bytes = built.bytes;
+        chunk.surface_triangles = triangles;
+        chunk.surface_detail = built.detail;
+        stream.terrain_rebuilt += 1;
+        stream.last_terrain_ms = built.elapsed_ms;
+        stream.installed_this_frame = true;
+    }
+    if stream.loaded_count() < MAX_CHUNKS {
+        return;
+    }
+    let mut wanted: Vec<_> = stream
+        .loaded
+        .iter()
+        .filter_map(|(key, chunk)| {
+            let target = if stream.terrain_lod_enabled {
+                TerrainDetail::choose(key.origin(), p, Some(chunk.surface_detail))
+            } else {
+                TerrainDetail::Near
+            };
+            (target != chunk.surface_detail && !stream.pending_surface.contains_key(key))
+                .then_some((*key, target))
+        })
+        .collect();
+    wanted.sort_by_key(|(key, detail)| (detail.index(), key.distance(stream.center), *key));
+    for (key, detail) in wanted
+        .into_iter()
+        .take(MAX_TASKS.saturating_sub(stream.pending_count()))
+    {
+        let g = stream.generator.clone();
+        let trees = stream.loaded[&key].trees.clone();
+        stream.pending_surface.insert(
+            key,
+            AsyncComputeTaskPool::get()
+                .spawn(async move { rebuild_surface(&g, key, detail, &trees) }),
         );
     }
 }
@@ -1245,6 +1488,7 @@ pub fn generation_report(generator: Generator, settings: TreeSettings) {
                 ChunkKey(x, z),
                 settings,
                 None,
+                TerrainDetail::Near,
             ));
         }
     }
@@ -1288,6 +1532,37 @@ pub fn generation_report(generator: Generator, settings: TreeSettings) {
         csv,
     )
     .expect("Cannot save vegetation comparison");
+    let mut terrain_csv = String::from(
+        "detail,chunks,vertices,triangles,terrain_mesh_mib,terrain_color_data_mib,worker_ms\n",
+    );
+    for detail in [
+        TerrainDetail::Near,
+        TerrainDetail::Middle,
+        TerrainDetail::Far,
+    ] {
+        let start = Instant::now();
+        let mut vertices = 0;
+        let mut triangles = 0;
+        for (i, chunk) in chunks.iter().enumerate() {
+            let key = ChunkKey(i as i32 % 3 - 1, i as i32 / 3 - 1);
+            let built = rebuild_surface(&generator, key, detail, &chunk.trees);
+            vertices += built.mesh.count_vertices();
+            triangles += built.mesh.indices().unwrap().len() / 3;
+        }
+        let mesh_bytes = vertices * 40 + triangles * 3 * 4;
+        let color_bytes = vertices * (size_of::<EnvironmentSample>() + size_of::<f32>());
+        terrain_csv.push_str(&format!(
+            "{detail:?},9,{vertices},{triangles},{:.3},{:.3},{:.3}\n",
+            mesh_bytes as f64 / (1024. * 1024.),
+            color_bytes as f64 / (1024. * 1024.),
+            start.elapsed().as_secs_f64() * 1000.
+        ));
+    }
+    std::fs::write(
+        format!("reports/terrain-lod-seed-{}.csv", generator.seed),
+        terrain_csv,
+    )
+    .expect("Cannot save terrain comparison");
     println!(
         "Saved {path}: 9 CPU-built chunks retained, {wall:.1} ms total, {mean:.1} ms mean, {mib:.1} MiB mesh data; excludes GPU/model loading; synchronous benchmark, not runtime frame latency"
     );
@@ -1298,6 +1573,106 @@ mod tests {
     use super::*;
     fn generator() -> Generator {
         Generator::new(42, TerrainSettings::default())
+    }
+    fn rendered_surface_height(mesh: &Mesh, key: ChunkKey, p: Vec2) -> f32 {
+        let Some(VertexAttributeValues::Float32x3(vertices)) =
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+        else {
+            panic!()
+        };
+        let Indices::U32(indices) = mesh.indices().unwrap() else {
+            panic!()
+        };
+        let q = p - key.origin();
+        indices
+            .chunks_exact(3)
+            .find_map(|t| {
+                let a = Vec3::from(vertices[t[0] as usize]);
+                let b = Vec3::from(vertices[t[1] as usize]);
+                let c = Vec3::from(vertices[t[2] as usize]);
+                let pa = Vec2::new(a.x, a.z);
+                let pb = Vec2::new(b.x, b.z);
+                let pc = Vec2::new(c.x, c.z);
+                let area = (pb - pa).perp_dot(pc - pa);
+                let u = (q - pa).perp_dot(pc - pa) / area;
+                let v = (pb - pa).perp_dot(q - pa) / area;
+                (u >= -0.00001 && v >= -0.00001 && u + v <= 1.00001)
+                    .then_some(a.y * (1. - u - v) + b.y * u + c.y * v)
+            })
+            .expect("Terrain mesh hole")
+    }
+    #[test]
+    fn terrain_levels_preserve_water_banks_roots_and_shared_borders_with_bounded_error() {
+        let mut reduced = 0;
+        for seed in [42, 20261003, 314159] {
+            let g = Generator::new(seed, TerrainSettings::default());
+            let ford = g.hydrology.get((0, 0)).unwrap().fords[0];
+            for key in [ChunkKey(0, 0), ChunkKey(2, -2), ChunkKey::at(ford.center)] {
+                let original = generate(g.clone(), key, TreeSettings::default());
+                for detail in [TerrainDetail::Middle, TerrainDetail::Far] {
+                    let ground = rebuild_surface(&g, key, detail, &original.trees);
+                    assert!(ground.bytes <= original.surface_bytes);
+                    reduced += usize::from(ground.bytes < original.surface_bytes);
+                    for z in 0..24 {
+                        for x in 0..24 {
+                            let p =
+                                key.origin() + Vec2::new(x as f32 * 4. + 0.5, z as f32 * 4. + 1.5);
+                            assert!(
+                                (rendered_surface_height(&ground.mesh, key, p) - g.ground(p)).abs()
+                                    <= terrain_lod::MAX_ERROR + 0.0002
+                            );
+                        }
+                    }
+                    for (p, _) in &original.trees {
+                        assert!(
+                            (rendered_surface_height(&ground.mesh, key, *p) - g.ground(*p)).abs()
+                                < 0.0002,
+                            "Tree root changed with terrain LOD"
+                        );
+                    }
+                    for mesh in [&original.water, &original.lake] {
+                        let Some(VertexAttributeValues::Float32x3(vertices)) =
+                            mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+                        else {
+                            panic!()
+                        };
+                        for triangle in vertices.chunks_exact(3).step_by(8) {
+                            let center = (Vec3::from(triangle[0])
+                                + Vec3::from(triangle[1])
+                                + Vec3::from(triangle[2]))
+                                / 3.;
+                            let p = key.origin() + Vec2::new(center.x, center.z);
+                            assert!(
+                                (rendered_surface_height(&ground.mesh, key, p) - g.ground(p)).abs()
+                                    < 0.0002,
+                                "LOD changed the ground under rendered water"
+                            );
+                        }
+                    }
+                    let next = ChunkKey(key.0 + 1, key.1);
+                    let adjacent =
+                        rebuild_surface(&g, next, TerrainDetail::Near, &g.tree_neighbours(next));
+                    for i in 0..SIDE {
+                        let p = key.origin() + Vec2::new(CHUNK_SIZE, i as f32 * CELL);
+                        assert!(
+                            (rendered_surface_height(&ground.mesh, key, p)
+                                - rendered_surface_height(&adjacent.mesh, next, p))
+                            .abs()
+                                < 0.0001,
+                            "Mixed LOD chunk seam"
+                        );
+                    }
+                    let again = rebuild_surface(&g, key, detail, &original.trees);
+                    assert_eq!(
+                        ground.mesh.attribute(Mesh::ATTRIBUTE_POSITION),
+                        again.mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+                    );
+                    assert_eq!(ground.mesh.indices(), again.mesh.indices());
+                    assert_eq!(ground.mesh.count_vertices(), ground.colors.samples.len());
+                }
+            }
+        }
+        assert!(reduced >= 12);
     }
     #[test]
     fn ford_stones_mark_both_dry_banks_leave_the_path_open_and_reproduce_across_chunks() {
@@ -1604,12 +1979,13 @@ mod tests {
             .insert_resource(Meadow::streamed(42, TerrainSettings::default()))
             .init_resource::<TreeSettings>()
             .init_resource::<vegetation::LodConfig>()
+            .init_resource::<terrain_lod::Config>()
             .init_resource::<MapLayer>()
             .init_resource::<crate::LabState>()
             .init_resource::<Assets<Mesh>>()
             .init_resource::<Assets<StandardMaterial>>()
             .add_systems(Startup, setup)
-            .add_systems(Update, (update, update_lod).chain());
+            .add_systems(Update, (update, update_terrain_lod, update_lod).chain());
         let horse = app
             .world_mut()
             .spawn((
@@ -1639,7 +2015,7 @@ mod tests {
                 let stream = app.world().resource::<StreamWorld>();
                 assert!(stream.loaded_count() <= MAX_CHUNKS && stream.pending_count() <= MAX_TASKS);
                 assert!(stream.watershed_count() <= 13);
-                assert!(app.world().resource::<Assets<Mesh>>().len() <= MAX_CHUNKS * 5);
+                assert!(app.world().resource::<Assets<Mesh>>().len() <= MAX_CHUNKS * 6);
                 if stream.loaded_count() == MAX_CHUNKS && stream.pending_count() == 0 {
                     break;
                 }
@@ -1650,6 +2026,39 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         };
+        settle(&mut app);
+        let (terrain, full_terrain) = app.world().resource::<StreamWorld>().terrain_triangles();
+        assert!(terrain < full_terrain * 9 / 10);
+        assert_eq!(
+            app.world().resource::<StreamWorld>().loaded[&ChunkKey(0, 0)].surface_detail,
+            TerrainDetail::Near
+        );
+        let old_surfaces: Vec<_> = app
+            .world()
+            .resource::<StreamWorld>()
+            .loaded
+            .values()
+            .filter(|c| c.surface_detail != TerrainDetail::Near)
+            .map(|c| c.surface_mesh)
+            .collect();
+        let reduced_bytes = app.world().resource::<StreamWorld>().mesh_mib();
+        app.world_mut()
+            .resource_mut::<StreamWorld>()
+            .terrain_lod_enabled = false;
+        settle(&mut app);
+        assert_eq!(
+            app.world().resource::<StreamWorld>().terrain_triangles().0,
+            full_terrain
+        );
+        assert!(app.world().resource::<StreamWorld>().mesh_mib() > reduced_bytes);
+        assert!(
+            old_surfaces
+                .iter()
+                .all(|id| app.world().resource::<Assets<Mesh>>().get(*id).is_none())
+        );
+        app.world_mut()
+            .resource_mut::<StreamWorld>()
+            .terrain_lod_enabled = true;
         settle(&mut app);
         let (actual, full) = app.world().resource::<StreamWorld>().vegetation_vertices();
         assert!(
@@ -1701,6 +2110,10 @@ mod tests {
             );
             let stream = app.world().resource::<StreamWorld>();
             assert!(stream.has_ground(p));
+            assert_eq!(
+                stream.loaded[&ChunkKey::at(p)].surface_detail,
+                TerrainDetail::Near
+            );
             assert!(
                 stream
                     .loaded

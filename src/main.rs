@@ -7,6 +7,7 @@ mod smoke;
 mod stream_smoke;
 mod streaming;
 mod terrain;
+mod terrain_lod;
 mod trees;
 mod vegetation;
 mod water;
@@ -194,6 +195,9 @@ fn main() {
         .insert_resource(vegetation::LodConfig {
             enabled: !args.iter().any(|a| a == "--no-vegetation-lod"),
         })
+        .insert_resource(terrain_lod::Config {
+            enabled: !args.iter().any(|a| a == "--no-terrain-lod"),
+        })
         .init_resource::<player::CameraRig>()
         .init_resource::<environment::MapLayer>()
         .add_systems(
@@ -220,6 +224,7 @@ fn main() {
                 animals::animate,
                 player::follow_camera,
                 world::update_layer,
+                streaming::update_terrain_lod,
                 streaming::update_lod,
                 player::update_hud,
                 monitor::update,

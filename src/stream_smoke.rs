@@ -268,6 +268,7 @@ pub fn verify(
     river: Res<crate::water::RiverMaterial>,
     materials: Res<Assets<StandardMaterial>>,
     config: Res<crate::vegetation::LodConfig>,
+    terrain_config: Res<crate::terrain_lod::Config>,
     mut exit: MessageWriter<AppExit>,
 ) {
     if smoke.elapsed
@@ -303,6 +304,17 @@ pub fn verify(
         0 => {
             smoke.initial_meshes = meshes.len() - stream.mesh_asset_count();
             smoke.initial_height = world.ground(Vec2::new(27., -23.));
+            let (actual, full) = stream.terrain_triangles();
+            if terrain_config.enabled {
+                assert!(actual < full, "Terrain LOD must reduce geometry at spawn");
+                let counts = stream.terrain_lod_counts();
+                assert!(
+                    counts.iter().all(|n| *n > 0),
+                    "Three terrain levels must be exercised"
+                );
+            } else {
+                assert_eq!(actual, full);
+            }
         }
         1 => {
             assert!(
@@ -434,9 +446,17 @@ pub fn verify(
                 return;
             }
             std::fs::create_dir_all("reports").expect("Cannot create smoke reports");
-            let mode = if config.enabled { "lod" } else { "full" };
+            let mode = format!(
+                "{}{}",
+                if config.enabled { "lod" } else { "full" },
+                if terrain_config.enabled {
+                    ""
+                } else {
+                    "-terrain-full"
+                }
+            );
             std::fs::write(format!("reports/stream-smoke-seed-{}-{mode}.csv", world.seed),
-                format!("view,settled_frames,mean_frame_ms,max_frame_ms,resident_cpu_mib,vegetation_triangles,full_vegetation_triangles,tree_near,tree_middle,tree_far,grass_near,grass_middle,grass_far,lod_rebuilds,last_lod_worker_ms,last_lod_install_ms\n{}\n", smoke.report_rows.join("\n"))).expect("Cannot save smoke metrics");
+                format!("view,settled_frames,mean_frame_ms,max_frame_ms,resident_cpu_mib,vegetation_triangles,full_vegetation_triangles,tree_near,tree_middle,tree_far,grass_near,grass_middle,grass_far,lod_rebuilds,last_lod_worker_ms,last_lod_install_ms,terrain_near,terrain_middle,terrain_far,terrain_triangles,full_terrain_triangles,terrain_rebuilds,last_terrain_worker_ms\n{}\n", smoke.report_rows.join("\n"))).expect("Cannot save smoke metrics");
             println!(
                 "STREAM SMOKE PASS: seam crossing, +/- distant coordinates, bounded 49 chunks / 2 tasks, asset eviction, deterministic revisit, cameras, map layers, shared rivers, bank view and mountain headwaters and calm lake, isolated landmark trees, vegetation LOD and FPS/follow switching, regional river connection, lake inlet, curved confluence, dry sand walking, water stop and walking across a shallow ford; 32 captures"
             );
@@ -482,7 +502,7 @@ pub fn verify(
     let (t, g) = stream.lod_counts();
     let mean = smoke.frames_ms.iter().sum::<f64>() / smoke.frames_ms.len().max(1) as f64;
     let maximum = smoke.frames_ms.iter().copied().fold(0., f64::max);
-    let row = format!(
+    let mut row = format!(
         "{name},{},{mean:.3},{maximum:.3},{:.3},{},{},{},{},{},{},{},{},{},{:.3},{:.3}",
         smoke.frames_ms.len(),
         stream.mesh_mib(),
@@ -498,6 +518,18 @@ pub fn verify(
         stream.last_lod_ms,
         stream.last_lod_install_ms
     );
+    let terrain = stream.terrain_lod_counts();
+    let (triangles, full_triangles) = stream.terrain_triangles();
+    row.push_str(&format!(
+        ",{},{},{},{},{},{},{:.3}",
+        terrain[0],
+        terrain[1],
+        terrain[2],
+        triangles,
+        full_triangles,
+        stream.terrain_rebuilt,
+        stream.last_terrain_ms
+    ));
     smoke.report_rows.push(row);
     smoke.frames_ms.clear();
     commands

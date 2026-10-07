@@ -29,7 +29,7 @@ Run these commands from the project root. The first build may take a while.
 # Explore a finite map.
 cargo run --locked
 
-# Generate new chunks as you explore, with tree and grass LOD.
+# Generate new chunks as you explore, with ground, tree, and grass LOD.
 cargo run --locked -- --streaming --seed 42
 ```
 
@@ -37,10 +37,14 @@ Click inside the window to control the horse. Close the window to quit.
 
 In streaming mode, neighboring regions share winding rivers that gradually widen downstream, at confluences, and near their inland lake. Terrain and water remain continuous across the internal region boundaries. Dry sand and gravel banks are walkable. Shallow fords are marked by small gray stone groups on both banks, protruding sand banks, and a visibly narrower water channel, with gentle approaches for crossing; deep rivers and lakes remain impassable. Moist banks support grass, small shrubs, and riverbank trees, while cooler uplands favor conifers.
 
-Streaming mode adjusts tree and grass detail to their estimated size on screen. Tree placement, colors, and collision remain consistent. The HUD shows near/middle/far chunk counts and vegetation triangles. To compare with full detail:
+Streaming mode adjusts tree and grass detail to their estimated size on screen. Ground uses three detail levels around the horse, keeping chunk borders, riverbanks, and tree roots detailed. Tree placement, colors, and collision remain consistent. The HUD shows near/middle/far chunk counts, ground and vegetation triangles, rebuild times, and a resident CPU memory estimate. Compare each type separately:
 
 ```sh
+# Compare with full vegetation detail, keeping ground LOD enabled.
 cargo run --locked -- --streaming --seed 42 --no-vegetation-lod
+
+# Compare with full ground detail, keeping vegetation LOD enabled.
+cargo run --locked -- --streaming --seed 42 --no-terrain-lod
 ```
 
 ## Controls
@@ -110,9 +114,11 @@ Cargo.lock                   Locked dependency versions
 |---|---|
 | `reports/seed-<seed>.csv` | Finite-map generation report. |
 | `reports/stream-seed-<seed>.csv` | Streaming generation report. |
+| `reports/terrain-lod-seed-<seed>.csv` | Three ground mesh levels compared on the same nine chunks. |
 | `reports/vegetation-lod-seed-<seed>.csv` | Three vegetation mesh levels compared on the same nine chunks. |
 | `reports/stream-smoke-seed-<seed>-lod.csv` | Streaming checks with LOD: geometry, memory estimates, and short frame samples. |
 | `reports/stream-smoke-seed-<seed>-full.csv` | The same checks with `--no-vegetation-lod`. |
+| `reports/stream-smoke-seed-<seed>-lod-terrain-full.csv` | Streaming checks with full ground detail and vegetation LOD. |
 | `captures/seed-<seed>/` | Finite-map screenshots. |
 | `captures/stream-seed-<seed>/` | Streaming screenshots. |
 | `target/` | Cargo build output. |

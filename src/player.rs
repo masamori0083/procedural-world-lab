@@ -426,8 +426,10 @@ pub fn update_hud(
     if let Some(stream) = stream {
         let (tree_lod, grass_lod) = stream.lod_counts();
         let (vertices, full) = stream.vegetation_vertices();
+        let terrain_lod = stream.terrain_lod_counts();
+        let (terrain_triangles, full_terrain_triangles) = stream.terrain_triangles();
         hud.0 = format!(
-            "MAP GENERATION LAB | STREAMING v{} | {view} | {status}\nSeed {}   Position {:.0}, {:.0} m   {}\nChunks {} / {}   Pending {} / 2   Generated {}   Evicted {}\nResident mesh + LOD data {:.1} MiB (CPU estimate)   Trees {}\nTree LOD N/M/F {}/{}/{}   Grass {}/{}/{}\nVegetation triangles {} / {} full   Rebuilds {} ({:.1} ms)\nWatersheds {}   River sources {}   Water triangles {}\nLast chunk worker {:.1} ms   Install {:.2} ms\nW/S Move   A/D + Mouse Turn   Shift Run   V FPS / Follow\nB Overview   Wheel Zoom   Esc Pause   R Start   L River bank   G Ford\nF3 Resources   F4 Map layers\n{}",
+            "MAP GENERATION LAB | STREAMING v{} | {view} | {status}\nSeed {}   Position {:.0}, {:.0} m   {}\nChunks {} / {}   Pending {} / 2   Generated {}   Evicted {}\nResident mesh + LOD data {:.1} MiB (CPU estimate)   Trees {}\nTree LOD N/M/F {}/{}/{}   Grass {}/{}/{}\nVegetation triangles {} / {} full   Rebuilds {} ({:.1} ms)\nTerrain LOD N/M/F {}/{}/{}   Triangles {} / {} full\nTerrain rebuilds {} ({:.1} ms)\nWatersheds {}   River sources {}   Water triangles {}\nLast chunk worker {:.1} ms   Install {:.2} ms\nW/S Move   A/D + Mouse Turn   Shift Run   V FPS / Follow\nB Overview   Wheel Zoom   Esc Pause   R Start   L River bank   G Ford\nF3 Resources   F4 Map layers\n{}",
             crate::streaming::VERSION,
             world.seed,
             position.translation.x,
@@ -452,6 +454,13 @@ pub fn update_hud(
             full / 3,
             stream.lod_rebuilt,
             stream.last_lod_ms,
+            terrain_lod[0],
+            terrain_lod[1],
+            terrain_lod[2],
+            terrain_triangles,
+            full_terrain_triangles,
+            stream.terrain_rebuilt,
+            stream.last_terrain_ms,
             stream.watershed_count(),
             stream.river_sources(),
             stream.water_vertices() / 3,
