@@ -8,6 +8,7 @@ mod stream_smoke;
 mod streaming;
 mod terrain;
 mod trees;
+mod vegetation;
 mod water;
 mod watershed;
 mod world;
@@ -190,6 +191,9 @@ fn main() {
                 }),
         )
         .add_plugins(FrameTimeDiagnosticsPlugin::default())
+        .insert_resource(vegetation::LodConfig {
+            enabled: !args.iter().any(|a| a == "--no-vegetation-lod"),
+        })
         .init_resource::<player::CameraRig>()
         .init_resource::<environment::MapLayer>()
         .add_systems(
@@ -216,6 +220,7 @@ fn main() {
                 animals::animate,
                 player::follow_camera,
                 world::update_layer,
+                streaming::update_lod,
                 player::update_hud,
                 monitor::update,
                 world::sway_trees,

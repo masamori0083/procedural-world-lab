@@ -11,7 +11,7 @@ pub const VEGETATION_RADIUS: f32 = PLAY_RADIUS + 8.0;
 pub const PLACEMENT_EXTENT: f32 = EXTENT - 15.0;
 pub const AREA_SCALE: usize = ((EXTENT / 160.0) * (EXTENT / 160.0)) as usize;
 pub(crate) const SIDE: usize = (EXTENT * 2.0 / CELL) as usize + 1;
-pub const GENERATOR_VERSION: u32 = 8;
+pub const GENERATOR_VERSION: u32 = 9;
 
 #[derive(Clone, Copy, Debug)]
 pub struct TerrainSettings {
@@ -456,9 +456,8 @@ impl Meadow {
     }
 
     pub fn near_water(&self, p: Vec2, margin: f32) -> bool {
-        if let Some(g) = &self.streaming {
-            let f = g.water(p);
-            return f.distance < f.width + 1. + margin;
+        if self.streaming.is_some() {
+            return self.water_blocks(p, margin, false);
         }
         self.river.as_ref().is_some_and(|river| {
             let field = river.at(p);
@@ -475,8 +474,7 @@ impl Meadow {
     /// Approximate horizontal distance to a bank, not a hydrological simulation.
     pub fn water_distance(&self, p: Vec2) -> f32 {
         if let Some(g) = &self.streaming {
-            let f = g.water(p);
-            return (f.distance - f.width).max(0.);
+            return g.water_distance(p);
         }
         let river = self.river.as_ref().map_or(f32::INFINITY, |river| {
             let field = river.at(p);
@@ -537,16 +535,57 @@ impl Meadow {
             .collect()
     }
 
+    /// Block water under the horse's small footprint, not the color of the bank.
+    fn water_blocks(&self, p: Vec2, margin: f32, allow_fords: bool) -> bool {
+        if let Some(g) = &self.streaming {
+            let f = g.water(p);
+            if f.distance >= f.width + 1. + CELL * 2. + margin {
+                return false;
+            }
+        }
+        let wet = |q: Vec2| {
+            if let Some(g) = &self.streaming {
+                let f = g.water(q);
+                // Broad rejection keeps the extra triangle samples local to shores.
+                if f.distance >= f.width + 1. + CELL * 2. {
+                    return false;
+                }
+                let depth = g.water_depth(q);
+                if allow_fords
+                    && g.hydrology.ford_strength(q) > 0.9
+                    && depth <= crate::watershed::MAX_WADING_DEPTH
+                {
+                    return false;
+                }
+                return depth >= -0.015;
+            }
+            let ground = self.ground(q);
+            self.river.as_ref().is_some_and(|river| {
+                let f = river.at(q);
+                f.distance < f.width + 1. + CELL * 2. && ground <= f.level + 0.015
+            }) || self
+                .ponds
+                .iter()
+                .any(|pond| pond.radius_at(q) < 1.65 && ground <= pond.level + 0.015)
+        };
+        if wet(p) {
+            return true;
+        }
+        margin > 0.
+            && (0..8)
+                .any(|i| wet(p + Vec2::from_angle(i as f32 * std::f32::consts::TAU / 8.) * margin))
+    }
+
     pub fn walkable(&self, p: Vec2) -> bool {
         if self.streaming.is_some() {
-            return !self.near_water(p, 0.6)
+            return !self.water_blocks(p, 0.35, true)
                 && self.slope(p) < 0.85
                 && self
                     .trees
                     .iter()
                     .all(|(q, size)| q.distance(p) >= 0.65 + size * 0.30);
         }
-        if p.length() > PLAY_RADIUS || self.near_water(p, 0.6) {
+        if p.length() > PLAY_RADIUS || self.water_blocks(p, 0.35, true) {
             return false;
         }
         if self

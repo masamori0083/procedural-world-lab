@@ -21,15 +21,27 @@ impl Default for TreeSettings {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Species {
     Rounded,
-    Slender,
+    Riparian,
+    Conifer,
     Spreading,
 }
 impl Species {
-    fn from_seed(seed: u32) -> Self {
-        match mix(seed) % 3 {
-            0 => Self::Rounded,
-            1 => Self::Slender,
-            _ => Self::Spreading,
+    /// Smooth habitat weights; nearby trees reuse a grove's draw rather than
+    /// switching species at a fixed elevation or river-distance boundary.
+    fn for_habitat(elevation: f32, water_distance: f32, seed: u32) -> Self {
+        let t = ((elevation - 12.) / 32.).clamp(0., 1.);
+        let cold = t * t * (3. - 2. * t);
+        let conifer = 0.05 + cold * 0.85;
+        let riparian = (-water_distance / 18.).exp() * (1. - cold) * 0.80;
+        let draw = mix(seed) as f32 / u32::MAX as f32;
+        if draw < conifer {
+            Self::Conifer
+        } else if draw < conifer + riparian {
+            Self::Riparian
+        } else if mix(seed ^ 0x734d_801b).is_multiple_of(3) {
+            Self::Spreading
+        } else {
+            Self::Rounded
         }
     }
 }
@@ -64,32 +76,13 @@ fn grove_species(world: &Meadow, p: Vec2) -> Species {
             }
         }
     }
-    let habitat = world.environment_at(nearest.2);
-    // Streaming grove identity uses raw terrain/climate, so a neighbouring
-    // watershed being cached or evicted cannot change species at an edge.
-    let (elevation, moisture) = world.stream_generator().map_or(
-        (
-            habitat.elevation - world.ground(Vec2::ZERO),
-            habitat.moisture,
-        ),
-        |g| {
-            (
-                g.base_height(nearest.2) - g.base_height(Vec2::ZERO),
-                0.24 + 0.30 * g.noise(nearest.2 * 0.018 + Vec2::new(219., -53.))
-                    + 0.15 * g.noise(nearest.2 * 0.035 + Vec2::splat(31.)),
-            )
-        },
+    // Grove climate depends on raw elevation, not a neighbour's cached watershed.
+    // The tree's own water distance is prepared before generation in every chunk.
+    let elevation = world.stream_generator().map_or_else(
+        || world.ground(nearest.2) - world.ground(Vec2::ZERO),
+        |g| g.base_height(nearest.2) - g.base_height(Vec2::ZERO),
     );
-    // Whole groves share a preference; a minority vary to avoid hard biome borders.
-    if mix(nearest.1).is_multiple_of(4) {
-        Species::from_seed(nearest.1)
-    } else if elevation > 16.0 {
-        Species::Slender
-    } else if moisture > 0.58 {
-        Species::Rounded
-    } else {
-        Species::Spreading
-    }
+    Species::for_habitat(elevation, world.water_distance(p), nearest.1)
 }
 
 /// Weighted actual neighbours, independent of render/load order.
@@ -140,7 +133,13 @@ impl TreeShape {
         // Position-based identity survives changes to traversal/spawn order.
         let seed = mix(world.seed ^ mix(p.x.to_bits()) ^ mix(p.y.to_bits().rotate_left(13)));
         let mut random = SeedRandom(seed);
-        let local_species = Species::from_seed(seed ^ 0x45bd_716c);
+        let habitat = world.environment_at(p);
+        let elevation = world.stream_generator().map_or_else(
+            || habitat.elevation - world.ground(Vec2::ZERO),
+            |g| g.base_height(p) - g.base_height(Vec2::ZERO),
+        );
+        let local_species =
+            Species::for_habitat(elevation, world.water_distance(p), seed ^ 0x45bd_716c);
         let species = if random.unit() < settings.forest_uniformity.clamp(0.0, 1.0) {
             grove_species(world, p)
         } else {
@@ -149,7 +148,8 @@ impl TreeShape {
         let v = settings.variation.clamp(0.0, 1.0);
         let (height, spread, vertical, color) = match species {
             Species::Rounded => (3.6, 1.65, 1.45, Vec3::new(0.27, 0.45, 0.16)),
-            Species::Slender => (4.15, 1.15, 1.85, Vec3::new(0.31, 0.48, 0.20)),
+            Species::Riparian => (4.15, 1.35, 1.90, Vec3::new(0.25, 0.43, 0.16)),
+            Species::Conifer => (5.4, 1.5, 1.5, Vec3::new(0.17, 0.32, 0.12)),
             Species::Spreading => (3.25, 1.95, 1.18, Vec3::new(0.32, 0.46, 0.17)),
         };
         let height = height * (1.0 + random.range(-0.20, 0.20) * v);
@@ -215,6 +215,39 @@ impl TreeShape {
                 (elbow, 0.064 * size),
                 (end, 0.022 * size),
             ]);
+        }
+        if species == Species::Conifer {
+            // Three overlapping tapered tiers give a recognizable evergreen silhouette.
+            leaves.clear();
+            branches.clear();
+            for tier in 0..3 {
+                let f = 0.43 + tier as f32 * 0.19;
+                let radius = spread * (1. - tier as f32 * 0.22) * size;
+                let center = Vec3::Y * height * f * size + lean * f * f * size;
+                leaves.push(LeafCluster {
+                    center,
+                    radii: Vec3::new(radius, height * 0.22 * size, radius),
+                    rotation: Quat::from_rotation_y(orientation + tier as f32 * 0.3),
+                    shade: 0.96 + tier as f32 * 0.035,
+                });
+                for side in 0..2 {
+                    let angle =
+                        orientation + tier as f32 * 1.1 + side as f32 * std::f32::consts::PI;
+                    branches.push(vec![
+                        (center - Vec3::Y * height * 0.10 * size, 0.07 * size),
+                        (
+                            center + Vec3::new(angle.cos(), -0.4, angle.sin()) * radius * 0.8,
+                            0.02 * size,
+                        ),
+                    ]);
+                }
+            }
+        } else if species == Species::Riparian {
+            // Hanging, narrow leaf clusters distinguish riverbank trees from oaks.
+            for leaf in leaves.iter_mut().skip(1) {
+                leaf.center.y -= vertical * size * 0.45;
+                leaf.radii *= Vec3::new(0.72, 1.18, 0.72);
+            }
         }
         Self {
             seed,
@@ -305,12 +338,62 @@ impl TreeShape {
     }
 
     pub fn wood_mesh(&self) -> Mesh {
+        self.wood_mesh_lod(crate::vegetation::Detail::Near)
+    }
+
+    pub fn wood_mesh_lod(&self, detail: crate::vegetation::Detail) -> Mesh {
+        use crate::vegetation::Detail;
         let mut surface = TreeSurface::default();
-        surface.tube(&self.trunk, self.bark_color);
-        for branch in &self.branches {
-            surface.tube(branch, self.bark_color * 0.96);
+        let sides = match detail {
+            Detail::Near => 7,
+            Detail::Middle => 5,
+            Detail::Far => 3,
+        };
+        // Keep the full trunk path: bent landmark silhouettes must survive simplification.
+        surface.tube(&self.trunk, self.bark_color, sides);
+        if detail != Detail::Far || self.landmark.is_some() {
+            for branch in &self.branches {
+                if detail == Detail::Near {
+                    surface.tube(branch, self.bark_color * 0.96, 7);
+                } else {
+                    surface.tube(
+                        &[branch[0], *branch.last().unwrap()],
+                        self.bark_color * 0.96,
+                        3,
+                    );
+                }
+            }
         }
         surface.mesh()
+    }
+
+    /// Conservative sphere covering every leaf cluster and the complete wooden skeleton.
+    pub fn bounds(&self) -> (Vec3, f32) {
+        let mut lo = Vec3::splat(f32::INFINITY);
+        let mut hi = Vec3::splat(f32::NEG_INFINITY);
+        for (p, r) in self.trunk.iter().chain(self.branches.iter().flatten()) {
+            lo = lo.min(*p - Vec3::splat(*r));
+            hi = hi.max(*p + Vec3::splat(*r));
+        }
+        for leaf in &self.leaves {
+            let rotation = Mat3::from_quat(leaf.rotation);
+            let r = (rotation.x_axis.abs() * leaf.radii.x
+                + rotation.y_axis.abs() * leaf.radii.y
+                + rotation.z_axis.abs() * leaf.radii.z)
+                * (1. + self.roughness);
+            lo = lo.min(leaf.center - r);
+            hi = hi.max(leaf.center + r);
+        }
+        ((lo + hi) * 0.5, (hi - lo).length())
+    }
+
+    pub fn full_crown_vertices(&self) -> usize {
+        self.leaves.len()
+            * if self.species == Species::Conifer {
+                48
+            } else {
+                240
+            }
     }
 
     pub fn crown_mesh(&self, unit: &Mesh) -> Mesh {
@@ -320,6 +403,33 @@ impl TreeShape {
         else {
             panic!("Crown template needs 3D positions");
         };
+        if self.species == Species::Conifer {
+            let sides = if vertices.len() > 20 {
+                8
+            } else if vertices.len() > 6 {
+                6
+            } else {
+                4
+            };
+            let mut surface = TreeSurface::default();
+            for leaf in &self.leaves {
+                let transform =
+                    |v: Vec3| leaf.center - self.crown_pivot + leaf.rotation * (v * leaf.radii);
+                let tip = transform(Vec3::Y);
+                let base = transform(-Vec3::Y);
+                for side in 0..sides {
+                    let point = |i: usize| {
+                        let a = i as f32 * std::f32::consts::TAU / sides as f32;
+                        transform(Vec3::new(a.cos(), -1., a.sin()))
+                    };
+                    let a = point(side);
+                    let b = point((side + 1) % sides);
+                    surface.triangle(a, tip, b, self.leaf_color * leaf.shade);
+                    surface.triangle(a, b, base, self.leaf_color * leaf.shade * 0.92);
+                }
+            }
+            return surface.mesh();
+        }
         let indices: Vec<_> = unit.indices().unwrap().iter().collect();
         let mut surface = TreeSurface::default();
         let mut random = SeedRandom(self.seed ^ 0xc419_a733);
@@ -362,8 +472,7 @@ impl TreeSurface {
         self.colors
             .extend([[color.red, color.green, color.blue, 1.0]; 3]);
     }
-    fn tube(&mut self, path: &[(Vec3, f32)], color: Vec3) {
-        const SIDES: usize = 7;
+    fn tube(&mut self, path: &[(Vec3, f32)], color: Vec3, sides: usize) {
         let axis = (path.last().unwrap().0 - path[0].0).normalize();
         let reference = if axis.x.abs() < 0.9 { Vec3::X } else { Vec3::Z };
         let u = (reference - axis * reference.dot(axis)).normalize();
@@ -371,24 +480,24 @@ impl TreeSurface {
         let rings: Vec<Vec<Vec3>> = path
             .iter()
             .map(|(center, radius)| {
-                (0..SIDES)
+                (0..sides)
                     .map(|i| {
-                        let angle = i as f32 * std::f32::consts::TAU / SIDES as f32;
+                        let angle = i as f32 * std::f32::consts::TAU / sides as f32;
                         *center + (u * angle.cos() + v * angle.sin()) * *radius
                     })
                     .collect()
             })
             .collect();
         for pair in rings.windows(2) {
-            for i in 0..SIDES {
-                let j = (i + 1) % SIDES;
+            for i in 0..sides {
+                let j = (i + 1) % sides;
                 self.triangle(pair[0][i], pair[0][j], pair[1][i], color);
                 self.triangle(pair[0][j], pair[1][j], pair[1][i], color);
             }
         }
         let last = rings.len() - 1;
-        for i in 0..SIDES {
-            let j = (i + 1) % SIDES;
+        for i in 0..sides {
+            let j = (i + 1) % sides;
             self.triangle(path[0].0, rings[0][j], rings[0][i], color);
             self.triangle(path[last].0, rings[last][i], rings[last][j], color);
         }
@@ -415,6 +524,41 @@ pub fn shapes(world: &Meadow, settings: TreeSettings) -> Vec<TreeShape> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn habitat_changes_species_probabilities_and_conifer_silhouettes_survive_lod() {
+        let count = |height, distance, kind| {
+            (0..1000)
+                .filter(|&seed| Species::for_habitat(height, distance, seed) == kind)
+                .count()
+        };
+        assert!(count(0., 5., Species::Riparian) > 500);
+        assert!(count(0., 100., Species::Riparian) < 10);
+        assert!(count(50., 100., Species::Conifer) > 850);
+        assert!(count(0., 100., Species::Conifer) < 100);
+        let world = Meadow::streamed(42, crate::terrain::TerrainSettings::default());
+        let p = (0..1000)
+            .map(|i| Vec2::new(i as f32 * 3., 27.))
+            .find(|p| {
+                TreeShape::at(&world, *p, 1., TreeSettings::default()).species == Species::Conifer
+            })
+            .unwrap();
+        let tree = TreeShape::at(&world, p, 1., TreeSettings::default());
+        assert_eq!(tree.leaves.len(), 3);
+        assert!(tree.leaves[0].radii.x > tree.leaves[2].radii.x);
+        let near = tree.crown_mesh(&Sphere::new(1.).mesh().ico(1).unwrap());
+        let middle = tree.crown_mesh(&Sphere::new(1.).mesh().ico(0).unwrap());
+        assert_eq!(near.count_vertices(), tree.full_crown_vertices());
+        assert!(middle.count_vertices() < near.count_vertices());
+        for mesh in [near, middle] {
+            let Some(bevy::mesh::VertexAttributeValues::Float32x3(normals)) =
+                mesh.attribute(Mesh::ATTRIBUTE_NORMAL)
+            else {
+                panic!()
+            };
+            assert!(normals.iter().all(|n| Vec3::from(*n).is_finite()));
+        }
+    }
+
     #[test]
     fn isolated_landmarks_are_large_diverse_repeatable_and_opt_out_is_exact() {
         let world = Meadow::streamed(42, crate::terrain::TerrainSettings::default());

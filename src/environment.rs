@@ -35,17 +35,22 @@ impl EnvironmentSample {
             .clamp(0.0, 1.0);
         let rockiness =
             smooth((slope - 0.40) / 0.70).max(smooth((relative_height - 20.0) / 35.0) * 0.85);
+        // Flooded/eroded edge stays open; trees form a band on the moist bank.
+        let riparian = (-((water_distance - 12.) / 16.).powi(2)).exp();
+        let canopy = smooth((forest_patch - 0.22) / 0.55).max(riparian * 0.65);
+        let treeline = smooth((relative_height - 45.) / 25.);
         let tree_density = (0.25 + 0.75 * moisture)
-            * smooth((forest_patch - 0.22) / 0.55)
+            * canopy
             * (1.0 - rockiness).powi(2)
             * (1.0 - altitude * 0.45)
+            * (1. - treeline)
             * (1.0 - smooth((slope - 0.40) / 0.25))
-            * smooth(water_distance / 5.0);
+            * smooth((water_distance - 2.) / 5.);
         let grass_density = (0.28 + 0.72 * moisture)
             * (1.0 - rockiness).powi(2)
             * (1.0 - altitude * 0.4)
             * (1.0 - smooth((slope - 0.50) / 0.25))
-            * smooth(water_distance / 1.5);
+            * smooth((water_distance - 0.3) / 2.);
         Self {
             elevation,
             slope,
@@ -148,6 +153,24 @@ mod tests {
         let water = EnvironmentSample::evaluate(-2.0, 0.0, 0.1, 0.0, 0.5, 0.7);
         assert_eq!(water.tree_density, 0.0);
         assert_eq!(water.grass_density, 0.0);
+    }
+
+    #[test]
+    fn riparian_band_increases_vegetation_but_leaves_the_edge_and_treeline_open() {
+        let sample = |distance, height| {
+            EnvironmentSample::evaluate(height, height, 0.1, distance, 0.5, 0.15)
+        };
+        let edge = sample(0.2, 0.);
+        let grass_bank = sample(1.5, 0.);
+        let wooded_bank = sample(12., 0.);
+        let inland = sample(100., 0.);
+        assert_eq!(edge.tree_density, 0.);
+        assert_eq!(edge.grass_density, 0.);
+        assert_eq!(grass_bank.tree_density, 0.);
+        assert!(grass_bank.grass_density > 0.);
+        assert!(wooded_bank.tree_density > inland.tree_density + 0.2);
+        assert!(wooded_bank.grass_density > inland.grass_density);
+        assert_eq!(sample(12., 75.).tree_density, 0.);
     }
 
     #[test]

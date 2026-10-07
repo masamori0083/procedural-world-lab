@@ -22,8 +22,12 @@ pub struct StreamSmoke {
     saved: usize,
     initial_meshes: usize,
     initial_height: f32,
+    frames_ms: Vec<f64>,
+    report_rows: Vec<String>,
     river_phase: Vec2,
     headwater_source: Vec2,
+    sand_start: Vec2,
+    ford: Option<crate::watershed::Ford>,
 }
 impl Default for StreamSmoke {
     fn default() -> Self {
@@ -36,8 +40,12 @@ impl Default for StreamSmoke {
             saved: 0,
             initial_meshes: 0,
             initial_height: 0.,
+            frames_ms: Vec::new(),
+            report_rows: Vec::new(),
             river_phase: Vec2::ZERO,
             headwater_source: Vec2::ZERO,
+            sand_start: Vec2::ZERO,
+            ford: None,
         }
     }
 }
@@ -46,6 +54,7 @@ pub fn drive(
     smoke: Option<ResMut<StreamSmoke>>,
     stream: Option<Res<StreamWorld>>,
     time: Res<Time>,
+    real_time: Res<Time<Real>>,
     lab: Res<LabState>,
     world: Res<Meadow>,
     mut keys: ResMut<ButtonInput<KeyCode>>,
@@ -115,7 +124,9 @@ pub fn drive(
                 let plan = g.hydrology.get((0, 0)).unwrap();
                 let p = (0..24)
                     .map(|n| {
-                        plan.lake + Vec2::from_angle(n as f32 * std::f32::consts::TAU / 24.) * 30.
+                        plan.lake
+                            + Vec2::from_angle(n as f32 * std::f32::consts::TAU / 24.)
+                                * (crate::watershed::LAKE_RADIUS + 13.)
                     })
                     .find(|p| world.walkable(*p))
                     .expect("Lake needs a dry shore view");
@@ -135,13 +146,90 @@ pub fn drive(
                 rig.frame_tree();
             }
             16 => keys.press(KeyCode::KeyB),
+            17 | 18 => keys.press(KeyCode::KeyV),
+            19 => {
+                let (p, yaw) = regional_river_view(&world);
+                horse.0.translation = Vec3::new(p.x, world.ground(p) + 0.025, p.y);
+                horse.1.speed = 0.;
+                horse.1.yaw = yaw;
+                horse.0.rotation = Quat::from_rotation_y(yaw);
+                rig.mode = ViewMode::ThirdPerson;
+            }
+            20 => keys.press(KeyCode::KeyB),
+            21 => {
+                let (p, yaw) = lake_inlet_view(&world);
+                horse.0.translation = Vec3::new(p.x, world.ground(p) + 0.025, p.y);
+                horse.1.speed = 0.;
+                horse.1.yaw = yaw;
+                horse.0.rotation = Quat::from_rotation_y(yaw);
+                *rig = CameraRig::default();
+                rig.captured = true;
+            }
+            22 => keys.press(KeyCode::KeyB),
+            23 => {
+                let (p, yaw) = confluence_view(&world);
+                horse.0.translation = Vec3::new(p.x, world.ground(p) + 0.025, p.y);
+                horse.1.speed = 0.;
+                horse.1.yaw = yaw;
+                horse.0.rotation = Quat::from_rotation_y(yaw);
+                *rig = CameraRig::default();
+                rig.captured = true;
+            }
+            24 => keys.press(KeyCode::KeyB),
+            25 => {
+                let (p, yaw) = sand_bank_view(&world);
+                smoke.sand_start = p;
+                horse.0.translation = Vec3::new(p.x, world.ground(p) + 0.025, p.y);
+                horse.1.speed = 0.;
+                horse.1.yaw = yaw;
+                horse.0.rotation = Quat::from_rotation_y(yaw);
+                *rig = CameraRig::default();
+                rig.captured = true;
+            }
+            27 => {
+                let lake = world
+                    .stream_generator()
+                    .unwrap()
+                    .hydrology
+                    .get((0, 0))
+                    .unwrap()
+                    .lake;
+                let p = Vec2::new(horse.0.translation.x, horse.0.translation.z);
+                let forward = (lake - p).normalize();
+                horse.1.yaw = (-forward.x).atan2(-forward.y);
+                horse.1.speed = 0.;
+            }
+            28 => {
+                let p = Vec2::new(horse.0.translation.x, horse.0.translation.z);
+                smoke.ford = world.stream_generator().unwrap().nearest_ford(p);
+                assert!(smoke.ford.is_some(), "No ford available for crossing");
+                keys.press(KeyCode::KeyG);
+            }
+            31 => keys.press(KeyCode::KeyB),
             _ => {}
         }
         smoke.fired = true;
     }
-    if smoke.stage == 1 {
+    if matches!(smoke.stage, 1 | 26 | 27) {
         keys.press(KeyCode::KeyW);
-        keys.press(KeyCode::ShiftLeft);
+        if smoke.stage == 1 {
+            keys.press(KeyCode::ShiftLeft);
+        }
+    }
+    if matches!(smoke.stage, 29 | 30) {
+        let ford = smoke.ford.unwrap();
+        let p = Vec2::new(horse.0.translation.x, horse.0.translation.z);
+        let across = (p - ford.center).dot(ford.across);
+        let target = if smoke.stage == 29 {
+            0.
+        } else {
+            ford.width + 15.
+        };
+        if across < target {
+            keys.press(KeyCode::KeyW);
+        } else {
+            horse.1.speed = 0.;
+        }
     }
     if lab.ready
         && stream.has_ground(Vec2::new(horse.0.translation.x, horse.0.translation.z))
@@ -163,6 +251,7 @@ pub fn drive(
             smoke.elapsed = 0.;
         } else {
             smoke.elapsed += time.delta_secs().min(0.1);
+            smoke.frames_ms.push(real_time.delta_secs_f64() * 1000.);
         }
     }
 }
@@ -178,12 +267,30 @@ pub fn verify(
     meshes: Res<Assets<Mesh>>,
     river: Res<crate::water::RiverMaterial>,
     materials: Res<Assets<StandardMaterial>>,
+    config: Res<crate::vegetation::LodConfig>,
     mut exit: MessageWriter<AppExit>,
 ) {
-    if smoke.elapsed < if smoke.stage == 1 { 2.0 } else { 1.0 } {
+    if smoke.elapsed
+        < if matches!(smoke.stage, 1 | 27) {
+            2.0
+        } else {
+            1.0
+        }
+    {
         return;
     }
     let p = Vec2::new(horse.0.translation.x, horse.0.translation.z);
+    if matches!(smoke.stage, 29 | 30) {
+        let ford = smoke.ford.unwrap();
+        let target = if smoke.stage == 29 {
+            0.
+        } else {
+            ford.width + 15.
+        };
+        if (p - ford.center).dot(ford.across) < target {
+            return;
+        }
+    }
     assert!(stream.loaded_count() <= MAX_CHUNKS);
     assert!(stream.pending_count() <= 2);
     assert!(stream.has_ground(p));
@@ -270,12 +377,68 @@ pub fn verify(
                 assert_eq!(rig.mode, ViewMode::Overview);
             }
         }
+        17 => assert_eq!(rig.mode, ViewMode::FirstPerson),
+        18 => assert_eq!(rig.mode, ViewMode::ThirdPerson),
+        19..=24 => {
+            assert!(world.walkable(p));
+            assert!(stream.water_vertices() > 0);
+            assert!(world.water_distance(p) < 45.);
+            if matches!(smoke.stage, 20 | 22 | 24) {
+                assert_eq!(rig.mode, ViewMode::Overview);
+            }
+        }
+        25..=27 => {
+            assert!(world.walkable(p) && !stream.tree_blocks(p, None));
+            let g = world.stream_generator().unwrap();
+            assert!(g.water_depth(p) < -0.015);
+            assert!(p.distance(smoke.sand_start) < 6.);
+            if smoke.stage == 26 {
+                assert!(
+                    p.distance(smoke.sand_start) > 1.5,
+                    "Horse must walk along dry sand"
+                );
+            } else if smoke.stage == 27 {
+                let lake = g.hydrology.get((0, 0)).unwrap().lake;
+                let inward = (lake - p).normalize();
+                assert_eq!(horse.1.speed, 0.);
+                assert!(
+                    !world.walkable(p + inward * 0.4),
+                    "Horse must stop at actual shoreline"
+                );
+            }
+        }
+        28..=31 => {
+            let ford = smoke.ford.unwrap();
+            assert!(world.walkable(p) && !stream.tree_blocks(p, None));
+            if smoke.stage == 28 {
+                assert!(p.distance(ford.entry()) < 0.01);
+            }
+            if smoke.stage == 29 {
+                let depth = world.stream_generator().unwrap().water_depth(p);
+                assert!(
+                    depth > 0.015 && depth <= crate::watershed::MAX_WADING_DEPTH,
+                    "Horse must be standing in shallow flowing water: {depth}"
+                );
+                assert!((p - ford.center).dot(ford.across).abs() < 0.2);
+            }
+            if matches!(smoke.stage, 30 | 31) {
+                assert!((p - ford.center).dot(ford.across) >= ford.width + 15.);
+                assert!(world.stream_generator().unwrap().water_depth(p) < 0.);
+            }
+            if smoke.stage == 31 {
+                assert_eq!(rig.mode, ViewMode::Overview);
+            }
+        }
         _ => {
-            if smoke.saved < 17 {
+            if smoke.saved < 32 {
                 return;
             }
+            std::fs::create_dir_all("reports").expect("Cannot create smoke reports");
+            let mode = if config.enabled { "lod" } else { "full" };
+            std::fs::write(format!("reports/stream-smoke-seed-{}-{mode}.csv", world.seed),
+                format!("view,settled_frames,mean_frame_ms,max_frame_ms,resident_cpu_mib,vegetation_triangles,full_vegetation_triangles,tree_near,tree_middle,tree_far,grass_near,grass_middle,grass_far,lod_rebuilds,last_lod_worker_ms,last_lod_install_ms\n{}\n", smoke.report_rows.join("\n"))).expect("Cannot save smoke metrics");
             println!(
-                "STREAM SMOKE PASS: seam crossing, +/- distant coordinates, bounded 49 chunks / 2 tasks, asset eviction, deterministic revisit, cameras, map layers, shared rivers, bank view and mountain headwaters and calm lake, isolated landmark trees; 17 captures"
+                "STREAM SMOKE PASS: seam crossing, +/- distant coordinates, bounded 49 chunks / 2 tasks, asset eviction, deterministic revisit, cameras, map layers, shared rivers, bank view and mountain headwaters and calm lake, isolated landmark trees, vegetation LOD and FPS/follow switching, regional river connection, lake inlet, curved confluence, dry sand walking, water stop and walking across a shallow ford; 32 captures"
             );
             exit.write(AppExit::Success);
             return;
@@ -299,7 +462,44 @@ pub fn verify(
         "lake",
         "landmark-tree",
         "landmark-overview",
+        "lod-first-person",
+        "lod-follow-return",
+        "regional-river",
+        "regional-river-overview",
+        "lake-inlet",
+        "lake-inlet-overview",
+        "confluence",
+        "confluence-overview",
+        "sand-bank",
+        "sand-bank-walk",
+        "shore-stop",
+        "ford-entry",
+        "ford-wading",
+        "ford-crossed",
+        "ford-overview",
     ][smoke.stage];
+    let (actual, full) = stream.vegetation_vertices();
+    let (t, g) = stream.lod_counts();
+    let mean = smoke.frames_ms.iter().sum::<f64>() / smoke.frames_ms.len().max(1) as f64;
+    let maximum = smoke.frames_ms.iter().copied().fold(0., f64::max);
+    let row = format!(
+        "{name},{},{mean:.3},{maximum:.3},{:.3},{},{},{},{},{},{},{},{},{},{:.3},{:.3}",
+        smoke.frames_ms.len(),
+        stream.mesh_mib(),
+        actual / 3,
+        full / 3,
+        t[0],
+        t[1],
+        t[2],
+        g[0],
+        g[1],
+        g[2],
+        stream.lod_rebuilt,
+        stream.last_lod_ms,
+        stream.last_lod_install_ms
+    );
+    smoke.report_rows.push(row);
+    smoke.frames_ms.clear();
     commands
         .spawn(Screenshot::primary_window())
         .observe(save_to_disk(format!(
@@ -311,6 +511,110 @@ pub fn verify(
     smoke.elapsed = 0.;
     smoke.fired = false;
     smoke.settled_spawn = false;
+}
+
+fn sand_bank_view(world: &Meadow) -> (Vec2, f32) {
+    let g = world.stream_generator().unwrap();
+    let lake = g.hydrology.get((0, 0)).unwrap().lake;
+    for i in 0..64 {
+        let direction = Vec2::from_angle(i as f32 * std::f32::consts::TAU / 64.);
+        let p = lake + direction * 28.8;
+        let forward = direction.perp();
+        let neighbours = g.tree_neighbours(ChunkKey::at(p));
+        let clear = |q: Vec2| neighbours.iter().all(|(t, _)| t.distance(q) > 2.5);
+        if (0..=20).all(|step| {
+            let q = p + forward * step as f32 * 0.2;
+            world.walkable(q) && clear(q)
+        }) && (0..=16).all(|step| clear(p - direction * step as f32 * 0.2))
+        {
+            return (p, (-forward.x).atan2(-forward.y));
+        }
+    }
+    panic!("No dry sandy lake bank for native walk test");
+}
+
+fn confluence_view(world: &Meadow) -> (Vec2, f32) {
+    let g = world.stream_generator().unwrap();
+    let plan = g.hydrology.get((0, 0)).unwrap();
+    for segment in &plan.segments {
+        let joint = segment.a.p;
+        if joint.distance(plan.lake) < crate::watershed::LAKE_RADIUS + 80.
+            || plan.segments.iter().filter(|s| s.b.p == joint).count() < 2
+        {
+            continue;
+        }
+        let normal = (segment.b.p - joint).normalize().perp();
+        for offset in [16., 24., 32., 40.] {
+            for side in [-1., 1.] {
+                let p = joint + normal * offset * side;
+                if world.walkable(p) && world.water_distance(p) < 45. {
+                    let toward = joint - p;
+                    return (p, (-toward.x).atan2(-toward.y));
+                }
+            }
+        }
+    }
+    panic!("Confluence requires a dry observation point")
+}
+
+fn lake_inlet_view(world: &Meadow) -> (Vec2, f32) {
+    let g = world.stream_generator().unwrap();
+    let plan = g.hydrology.get((0, 0)).unwrap();
+    for segment in &plan.segments {
+        if segment.a.p.distance(plan.lake) <= crate::watershed::LAKE_RADIUS
+            || segment.b.p.distance(plan.lake) > crate::watershed::LAKE_RADIUS
+        {
+            continue;
+        }
+        let mut lo = 0.;
+        let mut hi = 1.;
+        for _ in 0..16 {
+            let t = (lo + hi) * 0.5;
+            if segment.a.p.lerp(segment.b.p, t).distance(plan.lake) > crate::watershed::LAKE_RADIUS
+            {
+                lo = t;
+            } else {
+                hi = t;
+            }
+        }
+        let inlet = segment.a.p.lerp(segment.b.p, (lo + hi) * 0.5);
+        let normal = (segment.b.p - segment.a.p).normalize().perp();
+        for offset in [16., 24., 32., 40.] {
+            for side in [-1., 1.] {
+                let p = inlet + normal * offset * side;
+                if world.walkable(p) {
+                    let toward = inlet - p;
+                    return (p, (-toward.x).atan2(-toward.y));
+                }
+            }
+        }
+    }
+    panic!("Lake inlet requires a dry observation point")
+}
+
+fn regional_river_view(world: &Meadow) -> (Vec2, f32) {
+    let g = world.stream_generator().unwrap();
+    let plan = g.hydrology.get((0, 0)).unwrap();
+    let mut crossings: Vec<_> = plan
+        .segments
+        .iter()
+        .filter(|s| crate::watershed::key(s.a.p) != crate::watershed::key(s.b.p))
+        .collect();
+    crossings.sort_by(|a, b| a.a.p.length_squared().total_cmp(&b.a.p.length_squared()));
+    for segment in crossings {
+        let middle = segment.a.p.lerp(segment.b.p, 0.5);
+        let normal = (segment.b.p - segment.a.p).normalize().perp();
+        for offset in [16., 24., 32., 40.] {
+            for side in [-1., 1.] {
+                let p = middle + normal * offset * side;
+                if world.walkable(p) {
+                    let toward = middle - p;
+                    return (p, (-toward.x).atan2(-toward.y));
+                }
+            }
+        }
+    }
+    panic!("Regional river requires a dry observation point")
 }
 
 fn headwater_view(world: &Meadow) -> (Vec2, f32, Vec2) {

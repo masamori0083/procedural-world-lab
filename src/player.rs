@@ -191,6 +191,18 @@ pub fn controls(
         transform.rotation = Quat::IDENTITY;
         rig.snap = true;
     }
+    if keys.just_pressed(KeyCode::KeyG) && lab.ready {
+        let p = Vec2::new(transform.translation.x, transform.translation.z);
+        if let Some(ford) = world.stream_generator().and_then(|g| g.nearest_ford(p)) {
+            let p = ford.entry();
+            transform.translation = Vec3::new(p.x, world.ground(p) + 0.025, p.y);
+            horse.speed = 0.;
+            horse.yaw = (-ford.across.x).atan2(-ford.across.y);
+            transform.rotation = Quat::from_rotation_y(horse.yaw);
+            rig.mode = ViewMode::ThirdPerson;
+            rig.snap = true;
+        }
+    }
     if keys.just_pressed(KeyCode::KeyL) && lab.ready {
         let bank = if let Some(s) = &stream {
             s.river_bank(
@@ -412,8 +424,10 @@ pub fn update_hud(
         "Click to explore / resume"
     };
     if let Some(stream) = stream {
+        let (tree_lod, grass_lod) = stream.lod_counts();
+        let (vertices, full) = stream.vegetation_vertices();
         hud.0 = format!(
-            "MAP GENERATION LAB | STREAMING v{} | {view} | {status}\nSeed {}   Position {:.0}, {:.0} m   {}\nChunks {} / {}   Pending {} / 2   Generated {}   Evicted {}\nResident mesh data {:.1} MiB (CPU estimate)   Trees {}\nWatersheds {}   River sources {}   Water triangles {}\nLast chunk worker {:.1} ms   Install {:.2} ms\nW/S Move   A/D + Mouse Turn   Shift Run   V FPS / Follow\nB Overview   Wheel Zoom   Esc Pause   R Start   L River bank\nF3 Resources   F4 Map layers\n{}",
+            "MAP GENERATION LAB | STREAMING v{} | {view} | {status}\nSeed {}   Position {:.0}, {:.0} m   {}\nChunks {} / {}   Pending {} / 2   Generated {}   Evicted {}\nResident mesh + LOD data {:.1} MiB (CPU estimate)   Trees {}\nTree LOD N/M/F {}/{}/{}   Grass {}/{}/{}\nVegetation triangles {} / {} full   Rebuilds {} ({:.1} ms)\nWatersheds {}   River sources {}   Water triangles {}\nLast chunk worker {:.1} ms   Install {:.2} ms\nW/S Move   A/D + Mouse Turn   Shift Run   V FPS / Follow\nB Overview   Wheel Zoom   Esc Pause   R Start   L River bank   G Ford\nF3 Resources   F4 Map layers\n{}",
             crate::streaming::VERSION,
             world.seed,
             position.translation.x,
@@ -428,6 +442,16 @@ pub fn update_hud(
             stream.evicted,
             stream.mesh_mib(),
             stream.tree_count(),
+            tree_lod[0],
+            tree_lod[1],
+            tree_lod[2],
+            grass_lod[0],
+            grass_lod[1],
+            grass_lod[2],
+            vertices / 3,
+            full / 3,
+            stream.lod_rebuilt,
+            stream.last_lod_ms,
             stream.watershed_count(),
             stream.river_sources(),
             stream.water_vertices() / 3,
@@ -472,8 +496,11 @@ mod tests {
     use std::time::Duration;
 
     fn scene() -> (App, Entity) {
+        scene_with(Meadow::new(20261003))
+    }
+
+    fn scene_with(map: Meadow) -> (App, Entity) {
         let mut app = App::new();
-        let map = Meadow::new(20261003);
         let ground = map.ground(Vec2::ZERO);
         app.add_plugins(MinimalPlugins)
             .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
@@ -526,6 +553,103 @@ mod tests {
                 input.clear();
             }
             app.update();
+        }
+    }
+
+    #[test]
+    fn horse_can_walk_across_a_ford_and_back_without_entering_deep_water() {
+        for seed in [42, 20261003, 314159] {
+            let map = Meadow::streamed(seed, crate::terrain::TerrainSettings::default());
+            let ford = map
+                .stream_generator()
+                .unwrap()
+                .hydrology
+                .get((0, 0))
+                .unwrap()
+                .fords[0];
+            let (mut app, horse) = scene_with(map);
+            frames(&mut app, 1, &[KeyCode::KeyG]);
+            // The shortcut selects the nearest crossing; test a fixed selected crossing.
+            let start = ford.entry();
+            let h = app.world().resource::<Meadow>().ground(start);
+            app.world_mut()
+                .get_mut::<Transform>(horse)
+                .unwrap()
+                .translation = Vec3::new(start.x, h + 0.025, start.y);
+            app.world_mut()
+                .get_mut::<HorseController>(horse)
+                .unwrap()
+                .yaw = (-ford.across.x).atan2(-ford.across.y);
+            let frames_to_cross = ((2. * (ford.width + 15.) + 1.) / 3.5 * 60.).ceil() as usize + 30;
+            frames(&mut app, frames_to_cross, &[KeyCode::KeyW]);
+            let p = app.world().get::<Transform>(horse).unwrap().translation;
+            let p = Vec2::new(p.x, p.z);
+            assert!(
+                (p - ford.center).dot(ford.across) > ford.width + 15.,
+                "Horse failed to reach other bank: {seed} {p:?}"
+            );
+            assert!(
+                app.world()
+                    .resource::<Meadow>()
+                    .stream_generator()
+                    .unwrap()
+                    .water_depth(p)
+                    < 0.
+            );
+            app.world_mut()
+                .get_mut::<HorseController>(horse)
+                .unwrap()
+                .yaw += std::f32::consts::PI;
+            frames(&mut app, frames_to_cross, &[KeyCode::KeyW]);
+            let t = app.world().get::<Transform>(horse).unwrap();
+            let p = Vec2::new(t.translation.x, t.translation.z);
+            assert!((p - ford.center).dot(ford.across) < -ford.width - 14.);
+            assert!(app.world().resource::<Meadow>().walkable(p));
+        }
+    }
+
+    #[test]
+    fn horse_walks_on_previously_blocked_sand_then_stops_at_water() {
+        for seed in [42, 20261003] {
+            let map = Meadow::streamed(seed, crate::terrain::TerrainSettings::default());
+            let g = map.stream_generator().unwrap();
+            let lake = g.hydrology.get((0, 0)).unwrap().lake;
+            let direction = (0..64)
+                .map(|i| Vec2::from_angle(i as f32 * std::f32::consts::TAU / 64.))
+                .find(|d| {
+                    (0..=16)
+                        .all(|step| map.walkable(lake + *d * 31. + d.perp() * step as f32 * 0.2))
+                })
+                .unwrap();
+            let start = lake + direction * 31.;
+            let (mut app, horse) = scene_with(map);
+            let aim = |app: &mut App, position: Vec2, forward: Vec2| {
+                let ground = app.world().resource::<Meadow>().ground(position);
+                let mut t = app.world_mut().get_mut::<Transform>(horse).unwrap();
+                t.translation = Vec3::new(position.x, ground + 0.025, position.y);
+                let mut c = app.world_mut().get_mut::<HorseController>(horse).unwrap();
+                c.yaw = (-forward.x).atan2(-forward.y);
+                c.speed = 0.;
+            };
+            aim(&mut app, start, direction.perp());
+            frames(&mut app, 45, &[KeyCode::KeyW]);
+            let t = app.world().get::<Transform>(horse).unwrap();
+            let p = Vec2::new(t.translation.x, t.translation.z);
+            assert!(p.distance(start) > 1.5);
+            assert!(
+                p.distance(lake) < 33.6,
+                "Must remain on previously forbidden sand"
+            );
+            let inward = (lake - p).normalize();
+            aim(&mut app, p, inward);
+            frames(&mut app, 180, &[KeyCode::KeyW]);
+            let t = app.world().get::<Transform>(horse).unwrap();
+            let end = Vec2::new(t.translation.x, t.translation.z);
+            assert!(end.distance(p) > 1.);
+            assert!(app.world().resource::<Meadow>().walkable(end));
+            assert_eq!(app.world().get::<HorseController>(horse).unwrap().speed, 0.);
+            let map = app.world().resource::<Meadow>();
+            assert!(!map.walkable(end + inward * 0.4));
         }
     }
 
