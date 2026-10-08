@@ -23,6 +23,8 @@ pub struct StreamSmoke {
     initial_meshes: usize,
     initial_height: f32,
     frames_ms: Vec<f64>,
+    transition_frames_ms: Vec<f64>,
+    transition_done: bool,
     report_rows: Vec<String>,
     river_phase: Vec2,
     headwater_source: Vec2,
@@ -41,6 +43,8 @@ impl Default for StreamSmoke {
             initial_meshes: 0,
             initial_height: 0.,
             frames_ms: Vec::new(),
+            transition_frames_ms: Vec::new(),
+            transition_done: false,
             report_rows: Vec::new(),
             river_phase: Vec2::ZERO,
             headwater_source: Vec2::ZERO,
@@ -231,11 +235,19 @@ pub fn drive(
             horse.1.speed = 0.;
         }
     }
+    if (!smoke.transition_done || stream.pending_count() > 0 || stream.loaded_count() < MAX_CHUNKS)
+        && real_time.delta_secs_f64() > 0.
+    {
+        smoke
+            .transition_frames_ms
+            .push(real_time.delta_secs_f64() * 1000.);
+    }
     if lab.ready
         && stream.has_ground(Vec2::new(horse.0.translation.x, horse.0.translation.z))
         && stream.loaded_count() == MAX_CHUNKS
         && stream.pending_count() == 0
     {
+        smoke.transition_done = true;
         // A test-only teleport requests a new area before its watershed exists.
         // Select the final dry position AFTER workers have prepared that area.
         if matches!(smoke.stage, 2 | 3) && !smoke.settled_spawn {
@@ -447,16 +459,21 @@ pub fn verify(
             }
             std::fs::create_dir_all("reports").expect("Cannot create smoke reports");
             let mode = format!(
-                "{}{}",
+                "{}{}{}",
                 if config.enabled { "lod" } else { "full" },
                 if terrain_config.enabled {
                     ""
                 } else {
                     "-terrain-full"
+                },
+                if stream.scheduler_name() == "DISTANCE" {
+                    "-distance"
+                } else {
+                    ""
                 }
             );
             std::fs::write(format!("reports/stream-smoke-seed-{}-{mode}.csv", world.seed),
-                format!("view,settled_frames,mean_frame_ms,max_frame_ms,resident_cpu_mib,vegetation_triangles,full_vegetation_triangles,tree_near,tree_middle,tree_far,grass_near,grass_middle,grass_far,lod_rebuilds,last_lod_worker_ms,last_lod_install_ms,terrain_near,terrain_middle,terrain_far,terrain_triangles,full_terrain_triangles,terrain_rebuilds,last_terrain_worker_ms\n{}\n", smoke.report_rows.join("\n"))).expect("Cannot save smoke metrics");
+                format!("view,settled_frames,mean_frame_ms,max_frame_ms,resident_cpu_mib,vegetation_triangles,full_vegetation_triangles,tree_near,tree_middle,tree_far,grass_near,grass_middle,grass_far,lod_rebuilds,last_lod_worker_ms,last_lod_install_ms,terrain_near,terrain_middle,terrain_far,terrain_triangles,full_terrain_triangles,terrain_rebuilds,last_terrain_worker_ms,scheduler,queued,predicted_x,predicted_z,ground_wait_ms,max_ground_wait_ms,ground_wait_events,near_wait_ms,last_near_wait_ms,max_near_wait_ms,transition_frames,max_transition_frame_ms\n{}\n", smoke.report_rows.join("\n"))).expect("Cannot save smoke metrics");
             println!(
                 "STREAM SMOKE PASS: seam crossing, +/- distant coordinates, bounded 49 chunks / 2 tasks, asset eviction, deterministic revisit, cameras, map layers, shared rivers, bank view and mountain headwaters and calm lake, isolated landmark trees, vegetation LOD and FPS/follow switching, regional river connection, lake inlet, curved confluence, dry sand walking, water stop and walking across a shallow ford; 32 captures"
             );
@@ -530,8 +547,29 @@ pub fn verify(
         stream.terrain_rebuilt,
         stream.last_terrain_ms
     ));
+    row.push_str(&format!(
+        ",{},{},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{},{:.3}",
+        stream.scheduler_name(),
+        stream.queued,
+        stream.predicted.x,
+        stream.predicted.y,
+        stream.ground_wait_ms,
+        stream.max_ground_wait_ms,
+        stream.ground_wait_events,
+        stream.near_wait_ms,
+        stream.last_near_wait_ms,
+        stream.max_near_wait_ms,
+        smoke.transition_frames_ms.len(),
+        smoke
+            .transition_frames_ms
+            .iter()
+            .copied()
+            .fold(0., f64::max)
+    ));
     smoke.report_rows.push(row);
     smoke.frames_ms.clear();
+    smoke.transition_frames_ms.clear();
+    smoke.transition_done = false;
     commands
         .spawn(Screenshot::primary_window())
         .observe(save_to_disk(format!(

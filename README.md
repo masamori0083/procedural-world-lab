@@ -47,6 +47,12 @@ cargo run --locked -- --streaming --seed 42 --no-vegetation-lod
 cargo run --locked -- --streaming --seed 42 --no-terrain-lod
 ```
 
+Chunk generation and LOD updates share two workers, with at most one chunk or LOD result installed per frame and 49 resident chunks. Missing ground under the horse comes first, followed by foot-level terrain detail, chunks along the next two seconds of movement, and surrounding work. The HUD shows queued work, the predicted position, missing-ground movement stalls in game time, and completed/current foot-detail waits in wall time. To compare with distance ordering that fills the surrounding chunks before updating LOD:
+
+```sh
+cargo run --locked -- --streaming --seed 42 --no-stream-priority
+```
+
 ## Controls
 
 | Action | Input |
@@ -119,6 +125,7 @@ Cargo.lock                   Locked dependency versions
 | `reports/stream-smoke-seed-<seed>-lod.csv` | Streaming checks with LOD: geometry, memory estimates, and short frame samples. |
 | `reports/stream-smoke-seed-<seed>-full.csv` | The same checks with `--no-vegetation-lod`. |
 | `reports/stream-smoke-seed-<seed>-lod-terrain-full.csv` | Streaming checks with full ground detail and vegetation LOD. |
+| `reports/stream-smoke-seed-<seed>-lod-distance.csv` | Checks with `--no-stream-priority`, including waits and transition frame samples. |
 | `captures/seed-<seed>/` | Finite-map screenshots. |
 | `captures/stream-seed-<seed>/` | Streaming screenshots. |
 | `target/` | Cargo build output. |

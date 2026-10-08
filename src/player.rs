@@ -150,7 +150,7 @@ pub fn controls(
     scroll: Res<AccumulatedMouseScroll>,
     time: Res<Time>,
     world: Res<Meadow>,
-    stream: Option<Res<crate::streaming::StreamWorld>>,
+    mut stream: Option<ResMut<crate::streaming::StreamWorld>>,
     lab: Res<LabState>,
     mut rig: ResMut<CameraRig>,
     window: Single<(&Window, &mut CursorOptions), With<PrimaryWindow>>,
@@ -275,7 +275,18 @@ pub fn controls(
     for _ in 0..steps {
         let next = transform.translation + displacement / steps as f32;
         let p = Vec2::new(next.x, next.z);
-        if world.walkable(p)
+        let walkable = world.walkable(p);
+        if walkable && stream.as_ref().is_some_and(|stream| !stream.has_ground(p)) {
+            if displacement.length_squared() > 0. {
+                stream
+                    .as_mut()
+                    .unwrap()
+                    .record_ground_wait(time.delta_secs_f64());
+            }
+            horse.speed = 0.0;
+            break;
+        }
+        if walkable
             && stream
                 .as_ref()
                 .is_none_or(|stream| stream.has_ground(p) && !stream.tree_blocks(p, None))
@@ -429,7 +440,7 @@ pub fn update_hud(
         let terrain_lod = stream.terrain_lod_counts();
         let (terrain_triangles, full_terrain_triangles) = stream.terrain_triangles();
         hud.0 = format!(
-            "MAP GENERATION LAB | STREAMING v{} | {view} | {status}\nSeed {}   Position {:.0}, {:.0} m   {}\nChunks {} / {}   Pending {} / 2   Generated {}   Evicted {}\nResident mesh + LOD data {:.1} MiB (CPU estimate)   Trees {}\nTree LOD N/M/F {}/{}/{}   Grass {}/{}/{}\nVegetation triangles {} / {} full   Rebuilds {} ({:.1} ms)\nTerrain LOD N/M/F {}/{}/{}   Triangles {} / {} full\nTerrain rebuilds {} ({:.1} ms)\nWatersheds {}   River sources {}   Water triangles {}\nLast chunk worker {:.1} ms   Install {:.2} ms\nW/S Move   A/D + Mouse Turn   Shift Run   V FPS / Follow\nB Overview   Wheel Zoom   Esc Pause   R Start   L River bank   G Ford\nF3 Resources   F4 Map layers\n{}",
+            "MAP GENERATION LAB | STREAMING v{} | {view} | {status}\nSeed {}   Position {:.0}, {:.0} m   {}\nChunks {} / {}   Pending {} / 2   Generated {}   Evicted {}\nResident mesh + LOD data {:.1} MiB (CPU estimate)   Trees {}\nTree LOD N/M/F {}/{}/{}   Grass {}/{}/{}\nVegetation triangles {} / {} full   Rebuilds {} ({:.1} ms)\nTerrain LOD N/M/F {}/{}/{}   Triangles {} / {} full\nTerrain rebuilds {} ({:.1} ms)\nScheduler {}   Queued {}   Ahead {:.0}, {:.0} m\nGround wait total/max {:.1}/{:.1} ms   Stops {}\nFoot detail last/max {:.1}/{:.1} ms   Waiting {:.1} ms\nWatersheds {}   River sources {}   Water triangles {}\nLast chunk worker {:.1} ms   Install {:.2} ms\nW/S Move   A/D + Mouse Turn   Shift Run   V FPS / Follow\nB Overview   Wheel Zoom   Esc Pause   R Start   L River bank   G Ford\nF3 Resources   F4 Map layers\n{}",
             crate::streaming::VERSION,
             world.seed,
             position.translation.x,
@@ -461,6 +472,16 @@ pub fn update_hud(
             full_terrain_triangles,
             stream.terrain_rebuilt,
             stream.last_terrain_ms,
+            stream.scheduler_name(),
+            stream.queued,
+            stream.predicted.x,
+            stream.predicted.y,
+            stream.ground_wait_ms,
+            stream.max_ground_wait_ms,
+            stream.ground_wait_events,
+            stream.last_near_wait_ms,
+            stream.max_near_wait_ms,
+            stream.near_wait_ms,
             stream.watershed_count(),
             stream.river_sources(),
             stream.water_vertices() / 3,

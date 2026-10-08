@@ -198,6 +198,9 @@ fn main() {
         .insert_resource(terrain_lod::Config {
             enabled: !args.iter().any(|a| a == "--no-terrain-lod"),
         })
+        .insert_resource(streaming::PriorityConfig {
+            enabled: !args.iter().any(|a| a == "--no-stream-priority"),
+        })
         .init_resource::<player::CameraRig>()
         .init_resource::<environment::MapLayer>()
         .add_systems(
@@ -224,8 +227,7 @@ fn main() {
                 animals::animate,
                 player::follow_camera,
                 world::update_layer,
-                streaming::update_terrain_lod,
-                streaming::update_lod,
+                streaming::schedule,
                 player::update_hud,
                 monitor::update,
                 world::sway_trees,

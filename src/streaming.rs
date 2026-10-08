@@ -21,13 +21,106 @@ use std::{
     time::Instant,
 };
 
-pub const VERSION: u32 = 13;
+pub const VERSION: u32 = 14;
 pub const CHUNK_SIZE: f32 = 96.0;
 pub const RADIUS: i32 = 3;
 pub const MAX_CHUNKS: usize = ((RADIUS * 2 + 1) * (RADIUS * 2 + 1)) as usize;
 const MAX_TASKS: usize = 2;
 const SIDE: usize = (CHUNK_SIZE / CELL) as usize + 1;
 const TREE_CELL: f32 = 12.0;
+const LOOKAHEAD_SECONDS: f32 = 2.0;
+
+#[derive(Resource)]
+pub struct PriorityConfig {
+    pub enabled: bool,
+}
+impl Default for PriorityConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Work {
+    Chunk(ChunkKey),
+    Terrain(ChunkKey),
+    Vegetation(ChunkKey),
+}
+impl Work {
+    fn key(self) -> ChunkKey {
+        match self {
+            Self::Chunk(key) | Self::Terrain(key) | Self::Vegetation(key) => key,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Motion {
+    position: Vec2,
+    predicted: Vec2,
+}
+impl Motion {
+    fn new(transform: &Transform, horse: &HorseController) -> Self {
+        let position = Vec2::new(transform.translation.x, transform.translation.z);
+        let velocity = transform.rotation * Vec3::NEG_Z * horse.speed;
+        let ahead =
+            (Vec2::new(velocity.x, velocity.z) * LOOKAHEAD_SECONDS).clamp_length_max(CHUNK_SIZE);
+        Self {
+            position,
+            predicted: position + ahead,
+        }
+    }
+    // First intersection with a chunk's horizontal bounds. Corners and negative
+    // coordinates use the same grid as chunk ownership; no extra chunks are kept.
+    fn entry(self, key: ChunkKey) -> Option<f32> {
+        let delta = self.predicted - self.position;
+        if delta.length_squared() < 0.0001 {
+            return None;
+        }
+        let lo = key.origin();
+        let hi = lo + Vec2::splat(CHUNK_SIZE);
+        let mut enter = 0_f32;
+        let mut exit = 1_f32;
+        for axis in 0..2 {
+            if delta[axis].abs() < 0.00001 {
+                if self.position[axis] < lo[axis] || self.position[axis] >= hi[axis] {
+                    return None;
+                }
+            } else {
+                let a = (lo[axis] - self.position[axis]) / delta[axis];
+                let b = (hi[axis] - self.position[axis]) / delta[axis];
+                enter = enter.max(a.min(b));
+                exit = exit.min(a.max(b));
+                if enter > exit {
+                    return None;
+                }
+            }
+        }
+        if enter == exit && ChunkKey::at(self.predicted) != key {
+            None
+        } else {
+            Some(enter)
+        }
+    }
+    fn priority(self, work: Work, detail: usize) -> (u8, usize, u64, ChunkKey) {
+        let key = work.key();
+        let foot = key == ChunkKey::at(self.position);
+        let distance = self.position.distance_squared(
+            self.position
+                .clamp(key.origin(), key.origin() + Vec2::splat(CHUNK_SIZE)),
+        ) as u64;
+        let entry = self.entry(key);
+        let (rank, distance) = match work {
+            Work::Chunk(_) if foot => (0, 0),
+            Work::Terrain(_) if foot => (1, 0),
+            Work::Chunk(_) if entry.is_some() => (2, (entry.unwrap() * 1_000_000.) as u64),
+            Work::Chunk(_) => (3, distance),
+            Work::Terrain(_) => (4, distance),
+            Work::Vegetation(_) => (5, distance),
+        };
+        (rank, detail, distance, key)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ChunkKey(pub i32, pub i32);
@@ -864,11 +957,22 @@ pub struct StreamWorld {
     pending: BTreeMap<ChunkKey, Task<ChunkData>>,
     pending_lod: BTreeMap<ChunkKey, Task<vegetation::Built>>,
     pending_surface: BTreeMap<ChunkKey, Task<SurfaceBuilt>>,
+    priority_enabled: bool,
+    pub predicted: Vec2,
+    pub queued: usize,
+    pub ground_wait_ms: f64,
+    pub max_ground_wait_ms: f64,
+    pub ground_wait_events: u64,
+    ground_blocked: bool,
+    ground_wait_run_ms: f64,
+    near_wait: Option<(ChunkKey, Instant)>,
+    pub near_wait_ms: f64,
+    pub last_near_wait_ms: f64,
+    pub max_near_wait_ms: f64,
     terrain_lod_enabled: bool,
     pub terrain_rebuilt: u64,
     pub last_terrain_ms: f64,
     lod_enabled: bool,
-    installed_this_frame: bool,
     pub lod_rebuilt: u64,
     pub last_lod_ms: f64,
     pub last_lod_install_ms: f64,
@@ -883,6 +987,83 @@ pub struct StreamWorld {
     pub last_install_ms: f64,
 }
 impl StreamWorld {
+    pub fn scheduler_name(&self) -> &'static str {
+        if self.priority_enabled {
+            "PRIORITY"
+        } else {
+            "DISTANCE"
+        }
+    }
+    pub fn record_ground_wait(&mut self, seconds: f64) {
+        if seconds <= 0. {
+            return;
+        }
+        if self.ground_wait_run_ms == 0. {
+            self.ground_wait_events += 1;
+        }
+        self.ground_blocked = true;
+        self.ground_wait_run_ms += seconds * 1000.;
+        self.ground_wait_ms += seconds * 1000.;
+        self.max_ground_wait_ms = self.max_ground_wait_ms.max(self.ground_wait_run_ms);
+    }
+    fn measure_near_wait(&mut self, key: ChunkKey) {
+        let detailed = self
+            .loaded
+            .get(&key)
+            .is_some_and(|chunk| chunk.surface_detail == TerrainDetail::Near);
+        if detailed {
+            if let Some((target, start)) = self.near_wait.take()
+                && target == key
+            {
+                self.last_near_wait_ms = start.elapsed().as_secs_f64() * 1000.;
+                self.max_near_wait_ms = self.max_near_wait_ms.max(self.last_near_wait_ms);
+            }
+            self.near_wait_ms = 0.;
+        } else {
+            if self.near_wait.is_none_or(|(target, _)| target != key) {
+                self.near_wait = Some((key, Instant::now()));
+            }
+            self.near_wait_ms = self.near_wait.unwrap().1.elapsed().as_secs_f64() * 1000.;
+        }
+    }
+    fn priority(
+        &self,
+        work: Work,
+        motion: Motion,
+        view: Option<vegetation::View>,
+    ) -> (u8, usize, u64, ChunkKey) {
+        let key = work.key();
+        let detail = match work {
+            Work::Chunk(_) => 0,
+            Work::Terrain(_) => self.loaded.get(&key).map_or(3, |chunk| {
+                if self.terrain_lod_enabled {
+                    TerrainDetail::choose(key.origin(), motion.position, Some(chunk.surface_detail))
+                        .index()
+                } else {
+                    0
+                }
+            }),
+            Work::Vegetation(_) => self.loaded.get(&key).map_or(9, |chunk| {
+                let desired = chunk.vegetation.levels(view, Some(chunk.levels));
+                desired.trees.index() * 3 + desired.grass.index()
+            }),
+        };
+        if !self.priority_enabled {
+            let distance = match work {
+                Work::Chunk(_) => (key.origin() + Vec2::splat(CHUNK_SIZE * 0.5))
+                    .distance_squared(motion.position) as u64,
+                Work::Terrain(_) => key.distance(ChunkKey::at(motion.position)) as u64,
+                Work::Vegetation(_) => 0,
+            };
+            let rank = match work {
+                Work::Chunk(_) => 0,
+                Work::Terrain(_) => 1,
+                Work::Vegetation(_) => 2,
+            };
+            return (rank, detail, distance, key);
+        }
+        motion.priority(work, detail)
+    }
     pub fn river_sources(&self) -> usize {
         self.generator.hydrology.source_count()
     }
@@ -1003,12 +1184,14 @@ impl StreamWorld {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn setup(
     mut commands: Commands,
     world: Res<Meadow>,
     settings: Res<TreeSettings>,
     config: Res<vegetation::LodConfig>,
     terrain_config: Res<terrain_lod::Config>,
+    priority_config: Res<PriorityConfig>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     river: Option<Res<crate::water::RiverMaterial>>,
 ) {
@@ -1023,11 +1206,22 @@ pub fn setup(
         pending: BTreeMap::new(),
         pending_lod: BTreeMap::new(),
         pending_surface: BTreeMap::new(),
+        priority_enabled: priority_config.enabled,
+        predicted: Vec2::ZERO,
+        queued: 0,
+        ground_wait_ms: 0.,
+        max_ground_wait_ms: 0.,
+        ground_wait_events: 0,
+        ground_blocked: false,
+        ground_wait_run_ms: 0.,
+        near_wait: None,
+        near_wait_ms: 0.,
+        last_near_wait_ms: 0.,
+        max_near_wait_ms: 0.,
         terrain_lod_enabled: terrain_config.enabled,
         terrain_rebuilt: 0,
         last_terrain_ms: 0.,
         lod_enabled: config.enabled,
-        installed_this_frame: false,
         lod_rebuilt: 0,
         last_lod_ms: 0.,
         last_lod_install_ms: 0.,
@@ -1064,7 +1258,7 @@ pub fn setup(
 pub fn update(
     mut commands: Commands,
     stream: Option<ResMut<StreamWorld>>,
-    horse: Single<&Transform, With<HorseController>>,
+    horse: Single<(&Transform, &HorseController)>,
     camera: Query<(&Transform, &Projection, &Camera), With<crate::player::FollowCamera>>,
     layer: Res<MapLayer>,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -1074,7 +1268,6 @@ pub fn update(
     let Some(mut stream) = stream else {
         return;
     };
-    stream.installed_this_frame = false;
     let view = stream
         .lod_enabled
         .then(|| {
@@ -1084,7 +1277,8 @@ pub fn update(
                 .map(|(t, p, c)| vegetation::View::from_camera(t, p, c))
         })
         .flatten();
-    let p = Vec2::new(horse.translation.x, horse.translation.z);
+    let p = Vec2::new(horse.0.translation.x, horse.0.translation.z);
+    stream.ground_blocked = false;
     stream.center = ChunkKey::at(p);
     let center = stream.center;
     let unlit = *layer != MapLayer::Natural;
@@ -1112,278 +1306,259 @@ pub fn update(
         }
         stream.evicted += 1;
     }
-    // At most one finished chunk is installed per frame; CPU work never blocks input.
-    let keys: Vec<_> = stream.pending.keys().copied().collect();
-    for key in keys {
-        if let Some(mut data) = block_on(poll_once(stream.pending.get_mut(&key).unwrap())) {
-            stream.pending.remove(&key);
-            if key.distance(center) > RADIUS {
-                continue;
-            }
-            let start = Instant::now();
-            data.surface
-                .insert_attribute(Mesh::ATTRIBUTE_COLOR, data.colors.colors(*layer));
-            let surface = meshes.add(data.surface);
-            let surface_triangles = meshes.get(&surface).unwrap().indices().unwrap().len() / 3;
-            let trees =
-                (data.built.trees.count_vertices() > 0).then(|| meshes.add(data.built.trees));
-            let grass =
-                (data.built.grass.count_vertices() > 0).then(|| meshes.add(data.built.grass));
-            let vegetation_meshes: Vec<_> = [trees.as_ref(), grass.as_ref()]
-                .into_iter()
-                .flatten()
-                .map(|m| m.id())
-                .collect();
-            let water = (data.water.count_vertices() > 0).then(|| meshes.add(data.water));
-            let lake = (data.lake.count_vertices() > 0).then(|| meshes.add(data.lake));
-            let stones = (data.stones.count_vertices() > 0).then(|| meshes.add(data.stones));
-            // Bevy's GPU slab allocator does not allocate zero-length buffers.
-            let mut mesh_ids = vec![surface.id()];
-            mesh_ids.extend(
-                [
-                    trees.as_ref(),
-                    grass.as_ref(),
-                    water.as_ref(),
-                    lake.as_ref(),
-                    stones.as_ref(),
-                ]
-                .into_iter()
-                .flatten()
-                .map(|m| m.id()),
-            );
-            let origin = key.origin();
-            let mut tree_entity = Entity::PLACEHOLDER;
-            let mut surface_entity = Entity::PLACEHOLDER;
-            let mut grass_entity = Entity::PLACEHOLDER;
-            let root = commands
-                .spawn((
-                    Name::new(format!("Chunk {},{}", key.0, key.1)),
-                    Transform::from_xyz(origin.x, 0., origin.y),
-                    Visibility::default(),
-                ))
-                .with_children(|root| {
-                    if let Some(stones) = stones {
-                        root.spawn((
-                            Name::new("Ford bank stones"),
-                            Mesh3d(stones),
+    let motion = Motion::new(horse.0, horse.1);
+    let mut jobs: Vec<_> = stream
+        .pending
+        .keys()
+        .map(|k| Work::Chunk(*k))
+        .chain(stream.pending_surface.keys().map(|k| Work::Terrain(*k)))
+        .chain(stream.pending_lod.keys().map(|k| Work::Vegetation(*k)))
+        .collect();
+    jobs.sort_by_key(|job| stream.priority(*job, motion, view));
+    for job in jobs {
+        let key = job.key();
+        match job {
+            Work::Chunk(_) => {
+                let Some(mut data) = block_on(poll_once(stream.pending.get_mut(&key).unwrap()))
+                else {
+                    continue;
+                };
+                stream.pending.remove(&key);
+                if key.distance(center) > RADIUS {
+                    continue;
+                }
+                let start = Instant::now();
+                data.surface
+                    .insert_attribute(Mesh::ATTRIBUTE_COLOR, data.colors.colors(*layer));
+                let surface = meshes.add(data.surface);
+                let surface_triangles = meshes.get(&surface).unwrap().indices().unwrap().len() / 3;
+                let trees =
+                    (data.built.trees.count_vertices() > 0).then(|| meshes.add(data.built.trees));
+                let grass =
+                    (data.built.grass.count_vertices() > 0).then(|| meshes.add(data.built.grass));
+                let vegetation_meshes: Vec<_> = [trees.as_ref(), grass.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .map(|m| m.id())
+                    .collect();
+                let water = (data.water.count_vertices() > 0).then(|| meshes.add(data.water));
+                let lake = (data.lake.count_vertices() > 0).then(|| meshes.add(data.lake));
+                let stones = (data.stones.count_vertices() > 0).then(|| meshes.add(data.stones));
+                // Bevy's GPU slab allocator does not allocate zero-length buffers.
+                let mut mesh_ids = vec![surface.id()];
+                mesh_ids.extend(
+                    [
+                        trees.as_ref(),
+                        grass.as_ref(),
+                        water.as_ref(),
+                        lake.as_ref(),
+                        stones.as_ref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .map(|m| m.id()),
+                );
+                let origin = key.origin();
+                let mut tree_entity = Entity::PLACEHOLDER;
+                let mut surface_entity = Entity::PLACEHOLDER;
+                let mut grass_entity = Entity::PLACEHOLDER;
+                let root = commands
+                    .spawn((
+                        Name::new(format!("Chunk {},{}", key.0, key.1)),
+                        Transform::from_xyz(origin.x, 0., origin.y),
+                        Visibility::default(),
+                    ))
+                    .with_children(|root| {
+                        if let Some(stones) = stones {
+                            root.spawn((
+                                Name::new("Ford bank stones"),
+                                Mesh3d(stones),
+                                MeshMaterial3d(stream.trees_material.clone()),
+                            ));
+                        }
+                        surface_entity = root
+                            .spawn((
+                                TerrainSurface,
+                                data.colors,
+                                Mesh3d(surface.clone()),
+                                MeshMaterial3d(stream.terrain_material.clone()),
+                            ))
+                            .id();
+                        let mut entity = root.spawn((
+                            Transform::default(),
+                            Visibility::Inherited,
                             MeshMaterial3d(stream.trees_material.clone()),
                         ));
-                    }
-                    surface_entity = root
-                        .spawn((
-                            TerrainSurface,
-                            data.colors,
-                            Mesh3d(surface.clone()),
-                            MeshMaterial3d(stream.terrain_material.clone()),
-                        ))
-                        .id();
-                    let mut entity = root.spawn((
-                        Transform::default(),
-                        Visibility::Inherited,
-                        MeshMaterial3d(stream.trees_material.clone()),
-                    ));
-                    if let Some(trees) = trees {
-                        entity.insert(Mesh3d(trees));
-                    }
-                    tree_entity = entity.id();
-                    if let Some(water) = water {
-                        root.spawn((
-                            Mesh3d(water),
-                            MeshMaterial3d(stream.water_material.clone()),
-                            bevy::light::NotShadowCaster,
+                        if let Some(trees) = trees {
+                            entity.insert(Mesh3d(trees));
+                        }
+                        tree_entity = entity.id();
+                        if let Some(water) = water {
+                            root.spawn((
+                                Mesh3d(water),
+                                MeshMaterial3d(stream.water_material.clone()),
+                                bevy::light::NotShadowCaster,
+                            ));
+                        }
+                        if let Some(lake) = lake {
+                            root.spawn((
+                                Mesh3d(lake),
+                                MeshMaterial3d(stream.lake_material.clone()),
+                                bevy::light::NotShadowCaster,
+                            ));
+                        }
+                        let mut entity = root.spawn((
+                            Grass,
+                            Transform::default(),
+                            MeshMaterial3d(stream.grass_material.clone()),
+                            if *layer == MapLayer::Natural {
+                                Visibility::Inherited
+                            } else {
+                                Visibility::Hidden
+                            },
                         ));
+                        if let Some(grass) = grass {
+                            entity.insert(Mesh3d(grass));
+                        }
+                        grass_entity = entity.id();
+                    })
+                    .id();
+                stream.loaded.insert(
+                    key,
+                    Resident {
+                        root,
+                        surface_entity,
+                        surface_mesh: surface.id(),
+                        surface_detail: data.surface_detail,
+                        surface_bytes: data.surface_bytes,
+                        surface_triangles,
+                        tree_entity,
+                        grass_entity,
+                        vegetation: data.vegetation,
+                        levels: data.built.levels,
+                        vegetation_meshes,
+                        vegetation_vertices: data.built.vertices,
+                        meshes: mesh_ids,
+                        water_vertices: data.water_vertices,
+                        trees: data.trees,
+                        obstacles: data.obstacles,
+                        bytes: data.bytes,
+                    },
+                );
+                stream.generated += 1;
+                stream.last_build_ms = data.elapsed_ms;
+                stream.last_install_ms = start.elapsed().as_secs_f64() * 1000.;
+                lab.scene_setup_ms += stream.last_install_ms;
+            }
+            Work::Terrain(_) => {
+                let Some(mut built) =
+                    block_on(poll_once(stream.pending_surface.get_mut(&key).unwrap()))
+                else {
+                    continue;
+                };
+                stream.pending_surface.remove(&key);
+                let terrain_enabled = stream.terrain_lod_enabled;
+                let Some(chunk) = stream.loaded.get_mut(&key) else {
+                    continue;
+                };
+                let desired = if terrain_enabled {
+                    TerrainDetail::choose(key.origin(), p, Some(chunk.surface_detail))
+                } else {
+                    TerrainDetail::Near
+                };
+                if built.detail != desired {
+                    continue;
+                }
+                built
+                    .mesh
+                    .insert_attribute(Mesh::ATTRIBUTE_COLOR, built.colors.colors(*layer));
+                let triangles = built.mesh.indices().unwrap().len() / 3;
+                let surface = meshes.add(built.mesh);
+                commands
+                    .entity(chunk.surface_entity)
+                    .insert((Mesh3d(surface.clone()), built.colors));
+                meshes.remove(chunk.surface_mesh);
+                chunk.meshes.retain(|id| *id != chunk.surface_mesh);
+                chunk.surface_mesh = surface.id();
+                chunk.meshes.push(surface.id());
+                chunk.bytes = chunk.bytes - chunk.surface_bytes + built.bytes;
+                chunk.surface_bytes = built.bytes;
+                chunk.surface_triangles = triangles;
+                chunk.surface_detail = built.detail;
+                stream.terrain_rebuilt += 1;
+                stream.last_terrain_ms = built.elapsed_ms;
+            }
+            Work::Vegetation(_) => {
+                let Some(built) = block_on(poll_once(stream.pending_lod.get_mut(&key).unwrap()))
+                else {
+                    continue;
+                };
+                stream.pending_lod.remove(&key);
+                let Some(chunk) = stream.loaded.get_mut(&key) else {
+                    continue;
+                };
+                if chunk.vegetation.levels(view, Some(chunk.levels)) != built.levels {
+                    continue;
+                }
+                let start = Instant::now();
+                let trees = (built.trees.count_vertices() > 0).then(|| meshes.add(built.trees));
+                let grass = (built.grass.count_vertices() > 0).then(|| meshes.add(built.grass));
+                for (entity, mesh) in [
+                    (chunk.tree_entity, trees.as_ref()),
+                    (chunk.grass_entity, grass.as_ref()),
+                ] {
+                    let mut entity = commands.entity(entity);
+                    if let Some(mesh) = mesh {
+                        entity.insert(Mesh3d(mesh.clone()));
+                    } else {
+                        entity.remove::<Mesh3d>();
                     }
-                    if let Some(lake) = lake {
-                        root.spawn((
-                            Mesh3d(lake),
-                            MeshMaterial3d(stream.lake_material.clone()),
-                            bevy::light::NotShadowCaster,
-                        ));
-                    }
-                    let mut entity = root.spawn((
-                        Grass,
-                        Transform::default(),
-                        MeshMaterial3d(stream.grass_material.clone()),
-                        if *layer == MapLayer::Natural {
-                            Visibility::Inherited
-                        } else {
-                            Visibility::Hidden
-                        },
-                    ));
-                    if let Some(grass) = grass {
-                        entity.insert(Mesh3d(grass));
-                    }
-                    grass_entity = entity.id();
-                })
-                .id();
-            stream.loaded.insert(
-                key,
-                Resident {
-                    root,
-                    surface_entity,
-                    surface_mesh: surface.id(),
-                    surface_detail: data.surface_detail,
-                    surface_bytes: data.surface_bytes,
-                    surface_triangles,
-                    tree_entity,
-                    grass_entity,
-                    vegetation: data.vegetation,
-                    levels: data.built.levels,
-                    vegetation_meshes,
-                    vegetation_vertices: data.built.vertices,
-                    meshes: mesh_ids,
-                    water_vertices: data.water_vertices,
-                    trees: data.trees,
-                    obstacles: data.obstacles,
-                    bytes: data.bytes,
-                },
-            );
-            stream.installed_this_frame = true;
-            stream.generated += 1;
-            stream.last_build_ms = data.elapsed_ms;
-            stream.last_install_ms = start.elapsed().as_secs_f64() * 1000.;
-            lab.scene_setup_ms += stream.last_install_ms;
-            break;
-        }
-    }
-    let mut keep = BTreeSet::from([crate::watershed::key(Vec2::ZERO)]);
-    keep.extend(stream.pending.keys().flat_map(|k| tree_regions(*k)));
-    keep.extend(stream.pending_surface.keys().flat_map(|k| tree_regions(*k)));
-    let mut wanted = Vec::new();
-    for z in center.1 - RADIUS..=center.1 + RADIUS {
-        for x in center.0 - RADIUS..=center.0 + RADIUS {
-            let key = ChunkKey(x, z);
-            keep.extend(tree_regions(key));
-            if !stream.loaded.contains_key(&key) && !stream.pending.contains_key(&key) {
-                wanted.push(key);
+                }
+                commands
+                    .entity(chunk.grass_entity)
+                    .insert(if *layer == MapLayer::Natural {
+                        Visibility::Inherited
+                    } else {
+                        Visibility::Hidden
+                    });
+                for id in &chunk.vegetation_meshes {
+                    meshes.remove(*id);
+                }
+                chunk
+                    .meshes
+                    .retain(|id| !chunk.vegetation_meshes.contains(id));
+                chunk.vegetation_meshes = [trees.as_ref(), grass.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .map(|m| m.id())
+                    .collect();
+                chunk.meshes.extend(chunk.vegetation_meshes.iter().copied());
+                chunk.bytes = chunk.bytes - chunk.vegetation_vertices * 40 + built.vertices * 40;
+                chunk.vegetation_vertices = built.vertices;
+                chunk.levels = built.levels;
+                stream.lod_rebuilt += 1;
+                stream.last_lod_ms = built.elapsed_ms;
+                stream.last_lod_install_ms = start.elapsed().as_secs_f64() * 1000.;
             }
         }
-    }
-    stream.generator.hydrology.retain(&keep);
-    wanted.sort_by_key(|key| {
-        (
-            (key.origin() + Vec2::splat(CHUNK_SIZE * 0.5)).distance_squared(p) as u64,
-            *key,
-        )
-    });
-    for key in wanted
-        .into_iter()
-        .take(MAX_TASKS.saturating_sub(stream.pending_count()))
-    {
-        let generator = stream.generator.clone();
-        let settings = stream.settings;
-        let detail = if stream.terrain_lod_enabled {
-            TerrainDetail::choose(key.origin(), p, None)
-        } else {
-            TerrainDetail::Near
-        };
-        stream.pending.insert(
-            key,
-            AsyncComputeTaskPool::get()
-                .spawn(async move { generate_at(generator, key, settings, view, detail) }),
-        );
+        // Discarded/unfinished jobs do not spend this budget. One valid install does.
+        break;
     }
 }
 
-/// Terrain refinements share the same two-worker budget and one-install limit.
-pub fn update_terrain_lod(
-    mut commands: Commands,
+/// Recompute one shared queue after controls and camera updates. Existing workers
+/// run to completion (including evicted ones), always counting toward the cap.
+pub fn schedule(
     stream: Option<ResMut<StreamWorld>>,
-    horse: Single<&Transform, With<HorseController>>,
-    layer: Res<MapLayer>,
-    mut meshes: ResMut<Assets<Mesh>>,
-) {
-    let Some(mut stream) = stream else {
-        return;
-    };
-    let p = Vec2::new(horse.translation.x, horse.translation.z);
-    let keys: Vec<_> = stream.pending_surface.keys().copied().collect();
-    for key in keys {
-        let target = stream.loaded.get(&key).map(|chunk| {
-            if stream.terrain_lod_enabled {
-                TerrainDetail::choose(key.origin(), p, Some(chunk.surface_detail))
-            } else {
-                TerrainDetail::Near
-            }
-        });
-        // Evicted workers remain in the two-task budget until they finish.
-        if target.is_some() && stream.installed_this_frame {
-            continue;
-        }
-        let Some(mut built) = block_on(poll_once(stream.pending_surface.get_mut(&key).unwrap()))
-        else {
-            continue;
-        };
-        stream.pending_surface.remove(&key);
-        let Some(chunk) = stream.loaded.get_mut(&key) else {
-            continue;
-        };
-        if Some(built.detail) != target {
-            continue;
-        }
-        built
-            .mesh
-            .insert_attribute(Mesh::ATTRIBUTE_COLOR, built.colors.colors(*layer));
-        let triangles = built.mesh.indices().unwrap().len() / 3;
-        let surface = meshes.add(built.mesh);
-        commands
-            .entity(chunk.surface_entity)
-            .insert((Mesh3d(surface.clone()), built.colors));
-        meshes.remove(chunk.surface_mesh);
-        chunk.meshes.retain(|id| *id != chunk.surface_mesh);
-        chunk.surface_mesh = surface.id();
-        chunk.meshes.push(surface.id());
-        chunk.bytes = chunk.bytes - chunk.surface_bytes + built.bytes;
-        chunk.surface_bytes = built.bytes;
-        chunk.surface_triangles = triangles;
-        chunk.surface_detail = built.detail;
-        stream.terrain_rebuilt += 1;
-        stream.last_terrain_ms = built.elapsed_ms;
-        stream.installed_this_frame = true;
-    }
-    if stream.loaded_count() < MAX_CHUNKS {
-        return;
-    }
-    let mut wanted: Vec<_> = stream
-        .loaded
-        .iter()
-        .filter_map(|(key, chunk)| {
-            let target = if stream.terrain_lod_enabled {
-                TerrainDetail::choose(key.origin(), p, Some(chunk.surface_detail))
-            } else {
-                TerrainDetail::Near
-            };
-            (target != chunk.surface_detail && !stream.pending_surface.contains_key(key))
-                .then_some((*key, target))
-        })
-        .collect();
-    wanted.sort_by_key(|(key, detail)| (detail.index(), key.distance(stream.center), *key));
-    for (key, detail) in wanted
-        .into_iter()
-        .take(MAX_TASKS.saturating_sub(stream.pending_count()))
-    {
-        let g = stream.generator.clone();
-        let trees = stream.loaded[&key].trees.clone();
-        stream.pending_surface.insert(
-            key,
-            AsyncComputeTaskPool::get()
-                .spawn(async move { rebuild_surface(&g, key, detail, &trees) }),
-        );
-    }
-}
-
-/// Rebuild only vegetation, sharing the two-worker budget with new terrain chunks.
-/// Residents keep one mesh pair, not all three LODs. Collision uses the original blueprint.
-pub fn update_lod(
-    mut commands: Commands,
-    stream: Option<ResMut<StreamWorld>>,
+    horse: Single<(&Transform, &HorseController)>,
     camera: Query<(&Transform, &Projection, &Camera), With<crate::player::FollowCamera>>,
-    layer: Res<MapLayer>,
-    mut meshes: ResMut<Assets<Mesh>>,
 ) {
     let Some(mut stream) = stream else {
         return;
     };
+    let motion = Motion::new(horse.0, horse.1);
+    let p = motion.position;
+    let center = ChunkKey::at(p);
     let view = stream
         .lod_enabled
         .then(|| {
@@ -1393,86 +1568,94 @@ pub fn update_lod(
                 .map(|(t, p, c)| vegetation::View::from_camera(t, p, c))
         })
         .flatten();
-    if !stream.installed_this_frame {
-        let keys: Vec<_> = stream.pending_lod.keys().copied().collect();
-        for key in keys {
-            let Some(built) = block_on(poll_once(stream.pending_lod.get_mut(&key).unwrap())) else {
-                continue;
-            };
-            stream.pending_lod.remove(&key);
-            let Some(chunk) = stream.loaded.get_mut(&key) else {
-                continue;
-            };
-            let desired = chunk.vegetation.levels(view, Some(chunk.levels));
-            if desired != built.levels {
-                continue;
-            } // A moved camera must not install stale detail.
-            let start = Instant::now();
-            let trees = (built.trees.count_vertices() > 0).then(|| meshes.add(built.trees));
-            let grass = (built.grass.count_vertices() > 0).then(|| meshes.add(built.grass));
-            for (entity, mesh) in [
-                (chunk.tree_entity, trees.as_ref()),
-                (chunk.grass_entity, grass.as_ref()),
-            ] {
-                let mut entity = commands.entity(entity);
-                if let Some(mesh) = mesh {
-                    entity.insert(Mesh3d(mesh.clone()));
-                } else {
-                    entity.remove::<Mesh3d>();
-                }
+    stream.predicted = if stream.priority_enabled {
+        motion.predicted
+    } else {
+        p
+    };
+    stream.measure_near_wait(center);
+    if !stream.ground_blocked {
+        stream.ground_wait_run_ms = 0.;
+    }
+    let mut keep = BTreeSet::from([crate::watershed::key(Vec2::ZERO)]);
+    keep.extend(stream.pending.keys().flat_map(|k| tree_regions(*k)));
+    keep.extend(stream.pending_surface.keys().flat_map(|k| tree_regions(*k)));
+    let mut jobs = Vec::new();
+    for z in center.1 - RADIUS..=center.1 + RADIUS {
+        for x in center.0 - RADIUS..=center.0 + RADIUS {
+            let key = ChunkKey(x, z);
+            keep.extend(tree_regions(key));
+            if !stream.loaded.contains_key(&key) && !stream.pending.contains_key(&key) {
+                jobs.push(Work::Chunk(key));
             }
-            commands
-                .entity(chunk.grass_entity)
-                .insert(if *layer == MapLayer::Natural {
-                    Visibility::Inherited
-                } else {
-                    Visibility::Hidden
-                });
-            for id in &chunk.vegetation_meshes {
-                meshes.remove(*id);
-            }
-            chunk
-                .meshes
-                .retain(|id| !chunk.vegetation_meshes.contains(id));
-            chunk.vegetation_meshes = [trees.as_ref(), grass.as_ref()]
-                .into_iter()
-                .flatten()
-                .map(|m| m.id())
-                .collect();
-            chunk.meshes.extend(chunk.vegetation_meshes.iter().copied());
-            chunk.bytes = chunk.bytes - chunk.vegetation_vertices * 40 + built.vertices * 40;
-            chunk.vegetation_vertices = built.vertices;
-            chunk.levels = built.levels;
-            stream.lod_rebuilt += 1;
-            stream.last_lod_ms = built.elapsed_ms;
-            stream.last_lod_install_ms = start.elapsed().as_secs_f64() * 1000.;
-            stream.installed_this_frame = true;
-            break;
         }
     }
-    // New ground takes priority over refinements when the horse enters another area.
-    if stream.loaded_count() < MAX_CHUNKS {
-        return;
+    stream.generator.hydrology.retain(&keep);
+    if stream.priority_enabled || stream.loaded_count() == MAX_CHUNKS {
+        for (key, chunk) in &stream.loaded {
+            if key.distance(center) > RADIUS {
+                continue;
+            }
+            let desired = if stream.terrain_lod_enabled {
+                TerrainDetail::choose(key.origin(), p, Some(chunk.surface_detail))
+            } else {
+                TerrainDetail::Near
+            };
+            if desired != chunk.surface_detail && !stream.pending_surface.contains_key(key) {
+                jobs.push(Work::Terrain(*key));
+            }
+            if chunk.vegetation.levels(view, Some(chunk.levels)) != chunk.levels
+                && !stream.pending_lod.contains_key(key)
+            {
+                jobs.push(Work::Vegetation(*key));
+            }
+        }
     }
-    let mut wanted: Vec<_> = stream
-        .loaded
-        .iter()
-        .filter_map(|(key, chunk)| {
-            let desired = chunk.vegetation.levels(view, Some(chunk.levels));
-            (desired != chunk.levels && !stream.pending_lod.contains_key(key))
-                .then_some((*key, desired))
-        })
-        .collect();
-    wanted.sort_by_key(|(key, levels)| (levels.trees.index(), levels.grass.index(), *key));
-    for (key, levels) in wanted
-        .into_iter()
-        .take(MAX_TASKS.saturating_sub(stream.pending_count()))
-    {
-        let data = stream.loaded[&key].vegetation.clone();
-        stream.pending_lod.insert(
-            key,
-            AsyncComputeTaskPool::get().spawn(async move { data.build(levels) }),
-        );
+    jobs.sort_by_key(|job| stream.priority(*job, motion, view));
+    let available = MAX_TASKS.saturating_sub(stream.pending_count());
+    stream.queued = jobs.len().saturating_sub(available);
+    for job in jobs.into_iter().take(available) {
+        let key = job.key();
+        match job {
+            Work::Chunk(_) => {
+                let generator = stream.generator.clone();
+                let settings = stream.settings;
+                let detail = if stream.terrain_lod_enabled {
+                    TerrainDetail::choose(key.origin(), p, None)
+                } else {
+                    TerrainDetail::Near
+                };
+                stream.pending.insert(
+                    key,
+                    AsyncComputeTaskPool::get()
+                        .spawn(async move { generate_at(generator, key, settings, view, detail) }),
+                );
+            }
+            Work::Terrain(_) => {
+                let g = stream.generator.clone();
+                let chunk = &stream.loaded[&key];
+                let detail = if stream.terrain_lod_enabled {
+                    TerrainDetail::choose(key.origin(), p, Some(chunk.surface_detail))
+                } else {
+                    TerrainDetail::Near
+                };
+                let trees = chunk.trees.clone();
+                stream.pending_surface.insert(
+                    key,
+                    AsyncComputeTaskPool::get()
+                        .spawn(async move { rebuild_surface(&g, key, detail, &trees) }),
+                );
+            }
+            Work::Vegetation(_) => {
+                let chunk = &stream.loaded[&key];
+                let levels = chunk.vegetation.levels(view, Some(chunk.levels));
+                let data = chunk.vegetation.clone();
+                stream.pending_lod.insert(
+                    key,
+                    AsyncComputeTaskPool::get().spawn(async move { data.build(levels) }),
+                );
+            }
+        }
     }
 }
 
@@ -1571,6 +1754,66 @@ pub fn generation_report(generator: Generator, settings: TreeSettings) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn prediction_prioritizes_feet_then_the_actual_path_and_reverses_with_motion() {
+        let t = Transform::from_xyz(90., 0., 48.)
+            .with_rotation(Quat::from_rotation_y(-std::f32::consts::FRAC_PI_2));
+        let mut horse = HorseController { speed: 9., yaw: 0. };
+        let motion = Motion::new(&t, &horse);
+        assert!((motion.predicted - Vec2::new(108., 48.)).length() < 0.0001);
+        let foot = ChunkKey(0, 0);
+        let front = ChunkKey(1, 0);
+        let side = ChunkKey(0, 1);
+        assert!(motion.entry(front).is_some());
+        assert!(motion.entry(side).is_none());
+        let mut jobs = [
+            Work::Vegetation(foot),
+            Work::Chunk(side),
+            Work::Terrain(side),
+            Work::Chunk(front),
+            Work::Terrain(foot),
+            Work::Chunk(foot),
+        ];
+        jobs.sort_by_key(|w| motion.priority(*w, 0));
+        assert_eq!(
+            jobs,
+            [
+                Work::Chunk(foot),
+                Work::Terrain(foot),
+                Work::Chunk(front),
+                Work::Chunk(side),
+                Work::Terrain(side),
+                Work::Vegetation(foot)
+            ]
+        );
+        horse.speed = -2.;
+        let t = Transform::from_xyz(2., 0., 0.).with_rotation(t.rotation);
+        let reverse = Motion::new(&t, &horse);
+        assert!((reverse.predicted - Vec2::new(-2., 0.)).length() < 0.0001);
+        assert!(reverse.entry(ChunkKey(-1, 0)).is_some());
+        assert!(
+            reverse.entry(ChunkKey(-1, -1)).is_none(),
+            "Parallel grid border must use its owner"
+        );
+        assert!(reverse.entry(ChunkKey(1, 0)).is_none());
+        horse.speed = 0.;
+        let stopped = Motion::new(&t, &horse);
+        assert_eq!(stopped.predicted, stopped.position);
+        assert!(stopped.entry(front).is_none());
+        horse.speed = 1000.;
+        assert!(
+            (Motion::new(&t, &horse).predicted - stopped.position).length() <= CHUNK_SIZE + 0.0001
+        );
+        let corner = Motion {
+            position: Vec2::splat(90.),
+            predicted: Vec2::splat(108.),
+        };
+        assert!(corner.entry(ChunkKey(1, 1)).is_some());
+        assert!(
+            corner.entry(ChunkKey(1, 0)).is_none(),
+            "A corner-only touch is not a route"
+        );
+    }
     fn generator() -> Generator {
         Generator::new(42, TerrainSettings::default())
     }
@@ -1972,20 +2215,20 @@ mod tests {
             }
         }
     }
-    #[test]
-    fn asynchronous_chunks_stay_bounded_and_release_assets_on_travel() {
+    fn test_stream(priority: bool) -> (App, Entity, Entity) {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins)
             .insert_resource(Meadow::streamed(42, TerrainSettings::default()))
             .init_resource::<TreeSettings>()
             .init_resource::<vegetation::LodConfig>()
             .init_resource::<terrain_lod::Config>()
+            .insert_resource(PriorityConfig { enabled: priority })
             .init_resource::<MapLayer>()
             .init_resource::<crate::LabState>()
             .init_resource::<Assets<Mesh>>()
             .init_resource::<Assets<StandardMaterial>>()
             .add_systems(Startup, setup)
-            .add_systems(Update, (update, update_terrain_lod, update_lod).chain());
+            .add_systems(Update, (update, schedule).chain());
         let horse = app
             .world_mut()
             .spawn((
@@ -2008,11 +2251,188 @@ mod tests {
                 Transform::from_xyz(0., 5., 8.).looking_at(Vec3::ZERO, Vec3::Y),
             ))
             .id();
+        (app, horse, camera)
+    }
+
+    #[test]
+    fn movement_stall_metrics_count_attempts_and_separate_episodes() {
+        use bevy::{
+            input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll},
+            time::TimeUpdateStrategy,
+            window::{CursorOptions, PrimaryWindow},
+        };
+        let (mut app, horse, _) = test_stream(true);
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(
+            std::time::Duration::from_secs_f64(1. / 60.),
+        ))
+        .init_resource::<crate::player::CameraRig>()
+        .init_resource::<ButtonInput<KeyCode>>()
+        .init_resource::<ButtonInput<MouseButton>>()
+        .init_resource::<AccumulatedMouseMotion>()
+        .init_resource::<AccumulatedMouseScroll>()
+        .add_systems(
+            Update,
+            crate::player::controls.after(update).before(schedule),
+        );
+        app.world_mut().resource_mut::<crate::LabState>().ready = true;
+        app.world_mut()
+            .resource_mut::<crate::player::CameraRig>()
+            .captured = true;
+        app.world_mut().spawn((
+            Window {
+                focused: true,
+                ..default()
+            },
+            PrimaryWindow,
+            CursorOptions::default(),
+        ));
+        app.update();
+        let start = app.world().get::<Transform>(horse).unwrap().translation;
+        let step = |app: &mut App, moving: bool| {
+            // Hold loading at zero to deterministically exercise the real controls
+            // against missing dry ground, regardless of worker timing.
+            app.world_mut()
+                .resource_mut::<StreamWorld>()
+                .pending
+                .clear();
+            let mut input = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            input.reset_all();
+            if moving {
+                input.press(KeyCode::KeyW);
+            }
+            app.update();
+        };
+        step(&mut app, false);
+        assert_eq!(app.world().resource::<StreamWorld>().ground_wait_events, 0);
+        for _ in 0..3 {
+            step(&mut app, true);
+        }
+        let s = app.world().resource::<StreamWorld>();
+        assert_eq!(s.ground_wait_events, 1);
+        assert!((s.ground_wait_ms - 50.).abs() < 0.01);
+        assert!((s.max_ground_wait_ms - 50.).abs() < 0.01);
+        assert_eq!(
+            app.world().get::<Transform>(horse).unwrap().translation,
+            start
+        );
+        step(&mut app, false);
+        step(&mut app, true);
+        let s = app.world().resource::<StreamWorld>();
+        assert_eq!(s.ground_wait_events, 2);
+        assert!((s.ground_wait_ms - 1000. / 15.).abs() < 0.01);
+        assert!((s.max_ground_wait_ms - 50.).abs() < 0.01);
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .reset_all();
+        let wait = Instant::now();
+        while {
+            app.update();
+            let s = app.world().resource::<StreamWorld>();
+            s.loaded_count() != MAX_CHUNKS || s.pending_count() != 0
+        } {
+            assert!(wait.elapsed().as_secs() < 15);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let total = app.world().resource::<StreamWorld>().ground_wait_ms;
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::KeyW);
+        app.update();
+        assert!(
+            app.world()
+                .get::<Transform>(horse)
+                .unwrap()
+                .translation
+                .distance(start)
+                > 0.
+        );
+        assert_eq!(app.world().resource::<StreamWorld>().ground_wait_ms, total);
+    }
+
+    #[test]
+    fn foot_refinement_is_queued_before_the_ring_and_distance_mode_remains_available() {
+        let mut placements = Vec::new();
+        for priority in [false, true] {
+            let (mut app, horse, _) = test_stream(priority);
+            let settle = Instant::now();
+            loop {
+                app.update();
+                let s = app.world().resource::<StreamWorld>();
+                if s.loaded_count() == MAX_CHUNKS && s.pending_count() == 0 {
+                    break;
+                }
+                assert!(settle.elapsed().as_secs() < 15);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let target = ChunkKey(3, 0);
+            assert_eq!(
+                app.world().resource::<StreamWorld>().loaded[&target].surface_detail,
+                TerrainDetail::Far
+            );
+            app.world_mut()
+                .get_mut::<Transform>(horse)
+                .unwrap()
+                .translation = Vec3::new(330., 0., 48.);
+            app.update();
+            let s = app.world().resource::<StreamWorld>();
+            assert!(s.loaded_count() < MAX_CHUNKS);
+            assert_eq!(
+                s.pending_surface.contains_key(&target),
+                priority,
+                "Only priority mode should queue foot refinement ahead of the unfinished ring"
+            );
+            let start = Instant::now();
+            loop {
+                let before = {
+                    let s = app.world().resource::<StreamWorld>();
+                    s.generated + s.terrain_rebuilt + s.lod_rebuilt
+                };
+                app.update();
+                let s = app.world().resource::<StreamWorld>();
+                assert!(s.pending_count() <= MAX_TASKS && s.loaded_count() <= MAX_CHUNKS);
+                assert!(s.generated + s.terrain_rebuilt + s.lod_rebuilt - before <= 1);
+                assert!(s.watershed_count() <= 13);
+                if s.loaded[&target].surface_detail == TerrainDetail::Near {
+                    if !priority {
+                        assert_eq!(s.loaded_count(), MAX_CHUNKS);
+                    }
+                    assert!(s.last_near_wait_ms > 0.);
+                    placements.push(s.loaded[&target].trees.clone());
+                    println!(
+                        "SCHEDULING_COMPARISON mode={} foot_wait_ms={:.3} ready_chunks={} resident_mib={:.3}",
+                        s.scheduler_name(),
+                        s.last_near_wait_ms,
+                        s.loaded_count(),
+                        s.mesh_mib()
+                    );
+                    break;
+                }
+                assert!(start.elapsed().as_secs() < 15);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        assert_eq!(
+            placements[0], placements[1],
+            "Scheduling must not alter tree placement"
+        );
+    }
+
+    #[test]
+    fn asynchronous_chunks_stay_bounded_and_release_assets_on_travel() {
+        let (mut app, horse, camera) = test_stream(true);
         let settle = |app: &mut App| {
             let start = Instant::now();
             loop {
+                let before = {
+                    let s = app.world().get_resource::<StreamWorld>();
+                    s.map_or(0, |s| s.generated + s.terrain_rebuilt + s.lod_rebuilt)
+                };
                 app.update();
                 let stream = app.world().resource::<StreamWorld>();
+                assert!(
+                    stream.generated + stream.terrain_rebuilt + stream.lod_rebuilt - before <= 1,
+                    "All work types must share one install per frame"
+                );
                 assert!(stream.loaded_count() <= MAX_CHUNKS && stream.pending_count() <= MAX_TASKS);
                 assert!(stream.watershed_count() <= 13);
                 assert!(app.world().resource::<Assets<Mesh>>().len() <= MAX_CHUNKS * 6);
@@ -2127,6 +2547,81 @@ mod tests {
             trees
         );
         assert!(app.world().resource::<StreamWorld>().evicted >= 3 * MAX_CHUNKS as u64);
+        // Both workers finish before the next update: nearby terrain must install
+        // before a new background chunk, while the ring is still incomplete.
+        let target = ChunkKey(3, 0);
+        assert_eq!(
+            app.world().resource::<StreamWorld>().loaded[&target].surface_detail,
+            TerrainDetail::Far
+        );
+        app.world_mut()
+            .get_mut::<Transform>(horse)
+            .unwrap()
+            .translation = Vec3::new(330., 0., 48.);
+        app.update();
+        let count = app.world().resource::<StreamWorld>().loaded_count();
+        assert!(count < MAX_CHUNKS);
+        assert!(
+            app.world()
+                .resource::<StreamWorld>()
+                .pending_surface
+                .contains_key(&target)
+        );
+        let wait = Instant::now();
+        while {
+            let s = app.world().resource::<StreamWorld>();
+            !s.pending_surface.values().all(Task::is_finished)
+                || !s.pending.values().all(Task::is_finished)
+        } {
+            assert!(wait.elapsed().as_secs() < 10);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let before = app.world().resource::<StreamWorld>().terrain_rebuilt;
+        app.update();
+        let s = app.world().resource::<StreamWorld>();
+        assert_eq!(s.terrain_rebuilt, before + 1);
+        assert_eq!(
+            s.loaded_count(),
+            count,
+            "Terrain install must spend the only frame slot"
+        );
+        assert_eq!(s.loaded[&target].surface_detail, TerrainDetail::Near);
+        assert!(s.last_near_wait_ms > 0.);
+        // Inject a completed result from an obsolete distance request. It must
+        // be dropped without replacing the current Near mesh or adding assets.
+        settle(&mut app);
+        let (g, trees, old_surface) = {
+            let stream = app.world().resource::<StreamWorld>();
+            (
+                stream.generator.clone(),
+                stream.loaded[&target].trees.clone(),
+                stream.loaded[&target].surface_mesh,
+            )
+        };
+        app.world_mut()
+            .resource_mut::<StreamWorld>()
+            .pending_surface
+            .insert(
+                target,
+                AsyncComputeTaskPool::get()
+                    .spawn(async move { rebuild_surface(&g, target, TerrainDetail::Far, &trees) }),
+            );
+        let wait = Instant::now();
+        while !app.world().resource::<StreamWorld>().pending_surface[&target].is_finished() {
+            assert!(wait.elapsed().as_secs() < 10);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let before = app.world().resource::<StreamWorld>().terrain_rebuilt;
+        app.update();
+        let s = app.world().resource::<StreamWorld>();
+        assert!(!s.pending_surface.contains_key(&target));
+        assert_eq!(s.terrain_rebuilt, before);
+        assert_eq!(s.loaded[&target].surface_mesh, old_surface);
+        settle(&mut app);
+        assert_eq!(
+            app.world().resource::<Assets<Mesh>>().len(),
+            app.world().resource::<StreamWorld>().mesh_asset_count()
+        );
     }
 
     #[test]
