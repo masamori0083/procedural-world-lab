@@ -382,23 +382,40 @@ impl Blueprint {
         }
     }
 
+    #[cfg(test)]
     pub fn build_streamed(
         &self,
         request: StreamRequest,
         previous: Option<&StreamRequest>,
     ) -> Built {
+        bevy::tasks::block_on(self.build_streamed_incremental(
+            request,
+            previous,
+            &mut crate::work_budget::WorkBudget::unlimited(),
+        ))
+    }
+    pub async fn build_streamed_incremental(
+        &self,
+        request: StreamRequest,
+        previous: Option<&StreamRequest>,
+        budget: &mut crate::work_budget::WorkBudget,
+    ) -> Built {
         let start = Instant::now();
         let parts_changed = previous.is_none_or(|p| p.levels.grass != request.levels.grass);
-        let mut built = self.build_parts(
-            request.levels,
-            false,
-            parts_changed,
-            request.grass.is_none(),
-        );
+        let mut built = self
+            .build_parts_incremental(
+                request.levels,
+                false,
+                parts_changed,
+                request.grass.is_none(),
+                budget,
+            )
+            .await;
         for (index, tree) in self.trees.iter().enumerate() {
             let old = previous.map_or(0, |p| p.trees.masks[index]);
             let added = request.trees.masks[index] & !old;
             for detail in [Detail::Near, Detail::Middle, Detail::Far] {
+                budget.checkpoint().await;
                 if added & (1 << detail.index()) == 0 {
                     continue;
                 }
@@ -444,6 +461,9 @@ impl Blueprint {
                 .map(|_| [Batch::default(), Batch::default(), Batch::default()])
                 .collect();
             for (index, blade) in self.grass.iter().enumerate() {
+                if index % 32 == 0 {
+                    budget.checkpoint().await;
+                }
                 let i = grass_patch((blade.a + blade.b) * 0.5);
                 let old = previous
                     .and_then(|p| p.grass.as_ref())
@@ -467,6 +487,7 @@ impl Blueprint {
                 }
             }
             for (i, [near, middle, shadow]) in batches.into_iter().enumerate() {
+                budget.checkpoint().await;
                 for (detail, mut visual, mut proxy) in [
                     (Detail::Near, near, shadow),
                     (Detail::Middle, middle, Batch::default()),
@@ -571,10 +592,27 @@ impl Blueprint {
         include_parts: bool,
         include_grass: bool,
     ) -> Built {
+        bevy::tasks::block_on(self.build_parts_incremental(
+            levels,
+            include_trees,
+            include_parts,
+            include_grass,
+            &mut crate::work_budget::WorkBudget::unlimited(),
+        ))
+    }
+    async fn build_parts_incremental(
+        &self,
+        levels: Levels,
+        include_trees: bool,
+        include_parts: bool,
+        include_grass: bool,
+        budget: &mut crate::work_budget::WorkBudget,
+    ) -> Built {
         let start = Instant::now();
         let mut trees = Batch::default();
         let mut leaves = Batch::default();
         for t in self.trees.iter().filter(|_| include_trees) {
+            budget.checkpoint().await;
             let phase = (t.shape.seed % 10000) as f32 * std::f32::consts::TAU / 10000.;
             let amplitude = t.shape.foliage_wind_amplitude(levels.trees);
             let height = t.shape.trunk.last().unwrap().0.y;
@@ -605,6 +643,9 @@ impl Blueprint {
         if include_parts && include_grass && levels.grass != Detail::Far {
             let stride = if levels.grass == Detail::Near { 1 } else { 8 };
             for (index, blade) in self.grass.iter().enumerate().step_by(stride) {
+                if index % 32 == 0 {
+                    budget.checkpoint().await;
+                }
                 if self.refined_grass {
                     build_tuft(&mut grass, blade, index, levels.grass);
                     if levels.grass == Detail::Near {
@@ -617,6 +658,7 @@ impl Blueprint {
         }
         if include_parts && levels.grass != Detail::Far {
             for shrub in &self.shrubs {
+                budget.checkpoint().await;
                 let mut random = crate::plant_shapes::Random(u64::from(
                     shrub.center.x.to_bits() ^ shrub.center.z.to_bits(),
                 ));

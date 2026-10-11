@@ -359,10 +359,23 @@ impl Generator {
         self.tree_candidates(key, 3)
     }
     fn tree_candidates(&self, key: ChunkKey, halo: i32) -> Vec<(Vec2, f32)> {
+        block_on(self.tree_candidates_incremental(
+            key,
+            halo,
+            &mut crate::work_budget::WorkBudget::unlimited(),
+        ))
+    }
+    async fn tree_candidates_incremental(
+        &self,
+        key: ChunkKey,
+        halo: i32,
+        budget: &mut crate::work_budget::WorkBudget,
+    ) -> Vec<(Vec2, f32)> {
         let origin = (key.origin() / TREE_CELL).as_ivec2();
         let side = (CHUNK_SIZE / TREE_CELL) as i32;
         let mut trees = Vec::new();
         for z in origin.y - halo..origin.y + side + halo {
+            budget.checkpoint().await;
             for x in origin.x - halo..origin.x + side + halo {
                 let mut random = SeedRandom(coordinate_seed(self.seed ^ 0x221b_a701, x, z));
                 let p = (Vec2::new(x as f32, z as f32)
@@ -534,18 +547,41 @@ fn generate_at(
     view: Option<vegetation::View>,
     surface_detail: TerrainDetail,
 ) -> ChunkData {
+    block_on(generate_incremental(
+        generator,
+        key,
+        settings,
+        view,
+        surface_detail,
+        &mut crate::work_budget::WorkBudget::unlimited(),
+    ))
+}
+
+async fn generate_incremental(
+    generator: Generator,
+    key: ChunkKey,
+    settings: TreeSettings,
+    view: Option<vegetation::View>,
+    surface_detail: TerrainDetail,
+    budget: &mut crate::work_budget::WorkBudget,
+) -> ChunkData {
     let start = Instant::now();
     let origin = key.origin();
     let fields = crate::grassfield::Fields::new(generator.seed, origin);
-    generator.hydrology.prepare(
-        &generator,
-        crate::watershed::key(origin + Vec2::splat(CHUNK_SIZE * 0.5)),
-    );
+    generator
+        .hydrology
+        .prepare_incremental(
+            &generator,
+            crate::watershed::key(origin + Vec2::splat(CHUNK_SIZE * 0.5)),
+            budget,
+        )
+        .await;
     let mut positions = Vec::new();
     let mut normals = Vec::new();
     let mut samples = Vec::new();
     let mut patches = Vec::new();
     for z in 0..SIDE {
+        budget.checkpoint().await;
         for x in 0..SIDE {
             let p = origin + Vec2::new(x as f32, z as f32) * CELL;
             let height = generator.height(p);
@@ -561,9 +597,15 @@ fn generate_at(
             samples.push(sample);
         }
     }
-    let (water, lake) = water_meshes(&generator, origin, &positions);
+    let (water, lake) = water_meshes_incremental(&generator, origin, &positions, budget).await;
     let water_vertices = water.count_vertices() + lake.count_vertices();
-    let neighbours = generator.tree_neighbours(key);
+    for region in tree_regions(key) {
+        generator
+            .hydrology
+            .prepare_incremental(&generator, region, budget)
+            .await;
+    }
+    let neighbours = generator.tree_candidates_incremental(key, 3, budget).await;
     let trees: Vec<_> = neighbours
         .iter()
         .copied()
@@ -573,6 +615,7 @@ fn generate_at(
     let mut placed = Vec::new();
     let mut obstacles = Vec::new();
     for (p, size) in &trees {
+        budget.checkpoint().await;
         let tree = TreeShape::with_isolation(
             &world,
             *p,
@@ -590,11 +633,15 @@ fn generate_at(
         let offset = Vec3::new(q.x, generator.ground(*p), q.y);
         placed.push(vegetation::PlacedTree::new(tree, offset));
     }
-    let blades = crate::grassfield::generate(&generator, key, &fields, &positions, &samples);
+    let blades = crate::grassfield::generate_incremental(
+        &generator, key, &fields, &positions, &samples, budget,
+    )
+    .await;
     // Small riparian bushes share the grass batch/LOD; no extra draw calls or collision.
     let mut shrubs = Vec::new();
     let mut random = SeedRandom(coordinate_seed(generator.seed ^ 0x21b5_724d, key.0, key.1));
     for _ in 0..64 {
+        budget.checkpoint().await;
         let q = Vec2::new(random.range(0., CHUNK_SIZE), random.range(0., CHUNK_SIZE));
         let p = origin + q;
         let sample = generator.habitat(p);
@@ -620,7 +667,10 @@ fn generate_at(
         origin: Vec3::new(origin.x, 0., origin.y),
         refined_grass: generator.refined_grass,
     });
-    let built = vegetation.build_streamed(vegetation.stream_request(view, None), None);
+    let built = vegetation
+        .build_streamed_incremental(vegetation.stream_request(view, None), None, budget)
+        .await;
+    budget.checkpoint().await;
     let stones = ford_stone_mesh(&ford_stones(&generator, key), origin);
     let ground = simplify_surface(
         &generator,
@@ -632,6 +682,7 @@ fn generate_at(
         samples,
         patches,
     );
+    budget.checkpoint().await;
     let bytes = ground.bytes
         + built.vertices * vegetation::VERTEX_BYTES
         + vegetation.bytes()
@@ -749,16 +800,33 @@ fn rebuild_surface(
     detail: TerrainDetail,
     trees: &[(Vec2, f32)],
 ) -> SurfaceBuilt {
+    block_on(rebuild_surface_incremental(
+        g,
+        key,
+        detail,
+        trees,
+        &mut crate::work_budget::WorkBudget::unlimited(),
+    ))
+}
+
+async fn rebuild_surface_incremental(
+    g: &Generator,
+    key: ChunkKey,
+    detail: TerrainDetail,
+    trees: &[(Vec2, f32)],
+    budget: &mut crate::work_budget::WorkBudget,
+) -> SurfaceBuilt {
     let start = Instant::now();
     let fields = crate::grassfield::Fields::new(g.seed, key.origin());
     for region in tree_regions(key) {
-        g.hydrology.prepare(g, region);
+        g.hydrology.prepare_incremental(g, region, budget).await;
     }
     let mut positions = Vec::new();
     let mut normals = Vec::new();
     let mut samples = Vec::new();
     let mut patches = Vec::new();
     for z in 0..SIDE {
+        budget.checkpoint().await;
         for x in 0..SIDE {
             let p = key.origin() + Vec2::new(x as f32, z as f32) * CELL;
             positions.push([x as f32 * CELL, g.height(p), z as f32 * CELL]);
@@ -771,6 +839,7 @@ fn rebuild_surface(
         }
     }
     let mut built = simplify_surface(g, key, detail, trees, positions, normals, samples, patches);
+    budget.checkpoint().await;
     built.elapsed_ms = start.elapsed().as_secs_f64() * 1000.;
     built
 }
@@ -878,14 +947,30 @@ fn ford_stone_mesh(stones: &[FordStone], origin: Vec2) -> Mesh {
 
 /// Clip exactly the same global 2 m ground triangles used by terrain/collision.
 /// Boundary vertices and texture coordinates therefore agree across chunks.
+#[cfg(test)]
 fn water_meshes(g: &Generator, origin: Vec2, land: &[[f32; 3]]) -> (Mesh, Mesh) {
-    let fields: Vec<_> = land
-        .iter()
-        .map(|p| g.water(origin + Vec2::new(p[0], p[2])))
-        .collect();
+    block_on(water_meshes_incremental(
+        g,
+        origin,
+        land,
+        &mut crate::work_budget::WorkBudget::unlimited(),
+    ))
+}
+async fn water_meshes_incremental(
+    g: &Generator,
+    origin: Vec2,
+    land: &[[f32; 3]],
+    budget: &mut crate::work_budget::WorkBudget,
+) -> (Mesh, Mesh) {
+    let mut fields = Vec::with_capacity(land.len());
+    for row in land.chunks(64) {
+        budget.checkpoint().await;
+        fields.extend(row.iter().map(|p| g.water(origin + Vec2::new(p[0], p[2]))));
+    }
     let mut vertices = Vec::new();
     let mut lake_vertices = Vec::new();
     for z in 0..SIDE - 1 {
+        budget.checkpoint().await;
         for x in 0..SIDE - 1 {
             let a = z * SIDE + x;
             let c = a + SIDE;
@@ -2273,8 +2358,17 @@ pub fn schedule(
                 };
                 stream.pending.insert(
                     key,
-                    AsyncComputeTaskPool::get()
-                        .spawn(async move { generate_at(generator, key, settings, view, detail) }),
+                    AsyncComputeTaskPool::get().spawn(async move {
+                        generate_incremental(
+                            generator,
+                            key,
+                            settings,
+                            view,
+                            detail,
+                            &mut crate::work_budget::WorkBudget::runtime(),
+                        )
+                        .await
+                    }),
                 );
             }
             Work::Terrain(_) => {
@@ -2288,8 +2382,16 @@ pub fn schedule(
                 let trees = chunk.trees.clone();
                 stream.pending_surface.insert(
                     key,
-                    AsyncComputeTaskPool::get()
-                        .spawn(async move { rebuild_surface(&g, key, detail, &trees) }),
+                    AsyncComputeTaskPool::get().spawn(async move {
+                        rebuild_surface_incremental(
+                            &g,
+                            key,
+                            detail,
+                            &trees,
+                            &mut crate::work_budget::WorkBudget::runtime(),
+                        )
+                        .await
+                    }),
                 );
             }
             Work::Vegetation(_) => {
@@ -2299,8 +2401,14 @@ pub fn schedule(
                 let data = chunk.vegetation.clone();
                 stream.pending_lod.insert(
                     key,
-                    AsyncComputeTaskPool::get()
-                        .spawn(async move { data.build_streamed(request, Some(&previous)) }),
+                    AsyncComputeTaskPool::get().spawn(async move {
+                        data.build_streamed_incremental(
+                            request,
+                            Some(&previous),
+                            &mut crate::work_budget::WorkBudget::runtime(),
+                        )
+                        .await
+                    }),
                 );
             }
         }
@@ -2404,6 +2512,126 @@ pub fn generation_report(generator: Generator, settings: TreeSettings) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn geometry_fingerprint(data: &ChunkData) -> u64 {
+        let mut hash = 0xcbf29ce484222325_u64;
+        let mut add = |text: String| {
+            for byte in text.bytes() {
+                hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+            }
+        };
+        let meshes = [
+            &data.surface,
+            &data.water,
+            &data.lake,
+            &data.stones,
+            &data.built.trees,
+            &data.built.leaves,
+            &data.built.grass,
+            &data.built.shadow_grass,
+        ];
+        for mesh in meshes
+            .into_iter()
+            .chain(
+                data.built
+                    .tree_additions
+                    .iter()
+                    .flat_map(|t| [&t.wood, &t.leaves]),
+            )
+            .chain(
+                data.built
+                    .grass_additions
+                    .iter()
+                    .flat_map(|g| [&g.visual, &g.shadow]),
+            )
+        {
+            for (attribute, values) in mesh.attributes() {
+                add(format!("{}:{values:?}", attribute.name));
+            }
+            add(format!("{:?}", mesh.indices()));
+        }
+        add(format!(
+            "{:?}:{:?}",
+            data.trees,
+            data.built.request.as_ref().map(|r| &r.trees.masks)
+        ));
+        hash
+    }
+    #[test]
+    fn incremental_generation_preserves_published_geometry() {
+        // Captured from the published synchronous generator before this fix.
+        // Includes every position, normal, tint, UV, index and tree/grass LOD mesh.
+        for (key, expected) in [
+            (ChunkKey(0, 0), 0xa53e470470909e35),
+            (ChunkKey(1, -1), 0x0d1843003a1071d6),
+        ] {
+            let data = generate_at(
+                Generator::new(42, TerrainSettings::default()),
+                key,
+                TreeSettings::default(),
+                None,
+                TerrainDetail::Near,
+            );
+            assert_eq!(geometry_fingerprint(&data), expected);
+            let mut budget = crate::work_budget::WorkBudget::forced();
+            let incremental = block_on(generate_incremental(
+                Generator::new(42, TerrainSettings::default()),
+                key,
+                TreeSettings::default(),
+                None,
+                TerrainDetail::Near,
+                &mut budget,
+            ));
+            assert_eq!(geometry_fingerprint(&incremental), expected);
+            // A later terrain/vegetation rebuild must also yield and preserve
+            // the same meshes when resumed after arbitrarily many pauses.
+            let generator = Generator::new(42, TerrainSettings::default());
+            let mut terrain_budget = crate::work_budget::WorkBudget::forced();
+            let task = rebuild_surface_incremental(
+                &generator,
+                key,
+                TerrainDetail::Middle,
+                &data.trees,
+                &mut terrain_budget,
+            );
+            let mut task = std::pin::pin!(task);
+            assert!(block_on(poll_once(task.as_mut())).is_none());
+            let _ = block_on(task);
+            let request = data.vegetation.stream_request(None, None);
+            let task = data
+                .vegetation
+                .build_streamed_incremental(request, None, &mut budget);
+            let mut task = std::pin::pin!(task);
+            assert!(block_on(poll_once(task.as_mut())).is_none());
+            let built = block_on(task);
+            assert_eq!(built.vertices, data.built.vertices);
+        }
+    }
+
+    #[test]
+    fn browser_chunk_job_yields_before_completing() {
+        let mut budget = crate::work_budget::WorkBudget::forced();
+        let generator = Generator::new(42, TerrainSettings::default());
+        let cache = generator.hydrology.clone();
+        let cached_before = cache.len();
+        let task = generate_incremental(
+            generator,
+            ChunkKey(20, 20),
+            TreeSettings::default(),
+            None,
+            TerrainDetail::Near,
+            &mut budget,
+        );
+        let mut task = std::pin::pin!(task);
+        assert!(
+            block_on(poll_once(task.as_mut())).is_none(),
+            "A Web chunk must not finish all generation in one event-loop turn"
+        );
+        assert_eq!(
+            cache.len(),
+            cached_before,
+            "An unfinished river must not enter the shared cache"
+        );
+    }
     #[test]
     fn prediction_prioritizes_feet_then_the_actual_path_and_reverses_with_motion() {
         let t = Transform::from_xyz(90., 0., 48.)

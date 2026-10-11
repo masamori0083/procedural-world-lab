@@ -130,17 +130,19 @@ fn sample_grid(
     )
 }
 
-pub fn generate(
+pub async fn generate_incremental(
     g: &Generator,
     key: ChunkKey,
     fields: &Fields,
     positions: &[[f32; 3]],
     samples: &[EnvironmentSample],
+    budget: &mut crate::work_budget::WorkBudget,
 ) -> Vec<Blade> {
     let origin = key.origin();
     let grid_origin = (origin / TUFT_CELL).as_ivec2();
     let mut tufts = Vec::new();
     for z in 0..128 {
+        budget.checkpoint().await;
         for x in 0..128 {
             let mut random = SeedRandom(coordinate_seed(
                 g.seed ^ 0x581c_aa42,

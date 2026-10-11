@@ -35,12 +35,25 @@ pub fn system(k: Key) -> Key {
 pub struct Cache(RwLock<BTreeMap<Key, Arc<Plan>>>);
 impl Cache {
     pub fn prepare(&self, g: &Generator, k: Key) {
+        bevy::tasks::block_on(self.prepare_incremental(
+            g,
+            k,
+            &mut crate::work_budget::WorkBudget::unlimited(),
+        ));
+    }
+    pub async fn prepare_incremental(
+        &self,
+        g: &Generator,
+        k: Key,
+        budget: &mut crate::work_budget::WorkBudget,
+    ) {
         let k = system(k);
         if self.0.read().unwrap().contains_key(&k) {
             return;
         }
-        // Expensive planning is outside the lock, in the chunk worker.
-        let plan = Arc::new(Plan::generate(g, k));
+        // Never retain a cache lock across a browser yield. Publish a complete
+        // plan atomically, so terrain/collision cannot observe half a river.
+        let plan = Arc::new(Plan::generate_incremental(g, k, budget).await);
         self.0.write().unwrap().entry(k).or_insert(plan);
     }
     pub fn get(&self, k: Key) -> Option<Arc<Plan>> {
@@ -153,13 +166,29 @@ impl PartialOrd for Cell {
     }
 }
 impl Plan {
+    #[cfg(test)]
     fn generate(g: &Generator, k: Key) -> Self {
+        bevy::tasks::block_on(Self::generate_incremental(
+            g,
+            k,
+            &mut crate::work_budget::WorkBudget::unlimited(),
+        ))
+    }
+    async fn generate_incremental(
+        g: &Generator,
+        k: Key,
+        budget: &mut crate::work_budget::WorkBudget,
+    ) -> Self {
         let k = system(k);
         let origin = origin(k);
         let pos = |i: usize| {
             origin + Vec2::splat(MARGIN) + Vec2::new((i % SIDE) as f32, (i / SIDE) as f32) * STEP
         };
-        let land: Vec<_> = (0..SIDE * SIDE).map(|i| g.base_height(pos(i))).collect();
+        let mut land = Vec::with_capacity(SIDE * SIDE);
+        for row in 0..SIDE {
+            budget.checkpoint().await;
+            land.extend((row * SIDE..(row + 1) * SIDE).map(|i| g.base_height(pos(i))));
+        }
         let allowed: Vec<_> = (0..land.len()).map(|i| pos(i).length() > 70.).collect();
         let outlet = (0..land.len())
             .filter(|&i| {
@@ -180,6 +209,9 @@ impl Plan {
             i: outlet,
         });
         while let Some(c) = heap.pop() {
+            if order.len() % 64 == 0 {
+                budget.checkpoint().await;
+            }
             order.push(c.i);
             for (dx, dz) in [
                 (1, 0),
@@ -208,6 +240,7 @@ impl Plan {
         let mut area = vec![1u32; land.len()];
         let mut distance = vec![0.; land.len()];
         for &i in &order {
+            budget.checkpoint().await;
             if i != outlet {
                 distance[i] = distance[parents[i]] + pos(i).distance(pos(parents[i]));
             }
@@ -223,12 +256,18 @@ impl Plan {
         let mut elevations: Vec<_> = order.iter().map(|&i| land[i]).collect();
         elevations.sort_by(f32::total_cmp);
         let upland = elevations[elevations.len() * 3 / 4];
-        let mountain: Vec<_> = (0..land.len())
-            .map(|i| g.landform(pos(i)) == crate::terrain::Landform::Mountains)
-            .collect();
+        let mut mountain = Vec::with_capacity(land.len());
+        for row in 0..SIDE {
+            budget.checkpoint().await;
+            mountain.extend(
+                (row * SIDE..(row + 1) * SIDE)
+                    .map(|i| g.landform(pos(i)) == crate::terrain::Landform::Mountains),
+            );
+        }
         for _ in 0..5 {
             let mut best: Option<(bool, bool, f32, Vec<usize>)> = None;
             for &i in &order {
+                budget.checkpoint().await;
                 if used[i]
                     || land[i] < upland
                     || land[i] - land[outlet] < 2.
@@ -274,6 +313,7 @@ impl Plan {
         // above them. Junctions share one node, level, width and flow phase.
         let mut levels = vec![f32::INFINITY; land.len()];
         for &i in &order {
+            budget.checkpoint().await;
             if !used[i] {
                 continue;
             }
@@ -299,6 +339,7 @@ impl Plan {
         // coarse cells. A hard distance cutoff merely moves the water wall
         // upstream; the smooth ramp keeps that transition gradual too.
         for &i in &order {
+            budget.checkpoint().await;
             if used[i] {
                 let t = ((distance[i] - 36.) / 144.).clamp(0., 1.);
                 let blend = t * t * (3. - 2. * t);
@@ -335,7 +376,7 @@ impl Plan {
                 b: node(parents[i]),
             })
             .collect();
-        let segments = refine(g, &segments, lake);
+        let segments = refine_incremental(g, &segments, lake, budget).await;
         let lake_level = segments.iter().find(|s| s.b.p == lake).unwrap().b.level;
         let mut plan = Self {
             segments,
@@ -347,6 +388,7 @@ impl Plan {
             bins: vec![vec![]; BIN_SIDE * BIN_SIDE],
         };
         for (i, s) in plan.segments.iter().enumerate() {
+            budget.checkpoint().await;
             let padding = Vec2::splat(INFLUENCE + s.a.width.max(s.b.width) + 4.);
             let lo = ((s.a.p.min(s.b.p) - origin - padding) / BIN)
                 .floor()
@@ -362,7 +404,7 @@ impl Plan {
                 }
             }
         }
-        plan.place_fords(g, k);
+        plan.place_fords_incremental(g, k, budget).await;
         plan
     }
     pub fn ford_strength(&self, p: Vec2) -> f32 {
@@ -442,7 +484,12 @@ impl Plan {
             .sum::<f32>()
             - self.ground_with_fords(g, p)
     }
-    fn place_fords(&mut self, g: &Generator, owner: Key) {
+    async fn place_fords_incremental(
+        &mut self,
+        g: &Generator,
+        owner: Key,
+        budget: &mut crate::work_budget::WorkBudget,
+    ) {
         let mut random = crate::terrain::SeedRandom(
             g.seed
                 ^ (owner.0 as u32).wrapping_mul(0x83ac_142b)
@@ -450,6 +497,7 @@ impl Plan {
         );
         let mut candidates = Vec::new();
         for s in &self.segments {
+            budget.checkpoint().await;
             let center = s.a.p.lerp(s.b.p, 0.5);
             let width = (s.a.width + s.b.width) * 0.5;
             let direction = (s.b.p - s.a.p).normalize();
@@ -505,16 +553,24 @@ impl Plan {
             self.fords.push(ford);
             let steps = ((ford.width + 20.) / 0.25).ceil() as i32;
             // A narrowed ford must retain real water on the rendered terrain grid.
-            let valid = self.water_depth_with_fords(g, ford.center) > 0.015
-                && self.segments.iter().all(|segment| {
-                    (0..=10).all(|i| {
+            let mut valid = self.water_depth_with_fords(g, ford.center) > 0.015;
+            if valid {
+                for segment in &self.segments {
+                    budget.checkpoint().await;
+                    valid = (0..=10).all(|i| {
                         let t = i as f32 / 10.;
                         let flow = segment.a.flow + (segment.b.flow - segment.a.flow) * t;
                         (flow - ford.flow).abs() >= 14.
                             || self.water_depth_with_fords(g, segment.a.p.lerp(segment.b.p, t)) > 0.
-                    })
-                })
-                && (-steps..=steps).all(|i| {
+                    });
+                    if !valid {
+                        break;
+                    }
+                }
+            }
+            if valid {
+                for i in -steps..=steps {
+                    budget.checkpoint().await;
                     let p = ford.center + ford.across * i as f32 * 0.25;
                     let slope = Vec2::new(
                         self.ground_with_fords(g, p + Vec2::X * 0.5)
@@ -523,7 +579,7 @@ impl Plan {
                             - self.ground_with_fords(g, p - Vec2::Y * 0.5),
                     )
                     .length();
-                    slope < 0.75
+                    valid = slope < 0.75
                         && (0..=8).all(|i| {
                             let q = if i == 8 {
                                 p
@@ -537,8 +593,12 @@ impl Plan {
                             let depth = self.water_depth_with_fords(g, q);
                             depth < -0.015
                                 || (ford.strength(q) > 0.92 && depth < MAX_WADING_DEPTH - 0.01)
-                        })
-                });
+                        });
+                    if !valid {
+                        break;
+                    }
+                }
+            }
             if !valid {
                 self.fords.pop();
             }
@@ -612,7 +672,12 @@ fn interpolate(a: Node, b: Node, t: f32) -> Node {
 }
 /// Round individual reaches while preserving their source/junction/lake anchors.
 /// Rebuild one shared downhill graph after smoothing, including arc-length flow.
-fn refine(g: &Generator, coarse: &[Segment], lake: Vec2) -> Vec<Segment> {
+async fn refine_incremental(
+    g: &Generator,
+    coarse: &[Segment],
+    lake: Vec2,
+    budget: &mut crate::work_budget::WorkBudget,
+) -> Vec<Segment> {
     let mut ids = BTreeMap::new();
     let mut nodes = Vec::new();
     for s in coarse {
@@ -638,6 +703,7 @@ fn refine(g: &Generator, coarse: &[Segment], lake: Vec2) -> Vec<Segment> {
     let mut next = vec![usize::MAX; nodes.len()];
     next[outlet] = outlet;
     for start in 0..nodes.len() {
+        budget.checkpoint().await;
         if !anchor(start) || start == outlet {
             continue;
         }
@@ -693,6 +759,7 @@ fn refine(g: &Generator, coarse: &[Segment], lake: Vec2) -> Vec<Segment> {
         cursor += 1;
     }
     for &i in &order {
+        budget.checkpoint().await;
         let radius = if i == outlet {
             LAKE_RADIUS + 7.
         } else {
@@ -722,6 +789,7 @@ fn refine(g: &Generator, coarse: &[Segment], lake: Vec2) -> Vec<Segment> {
     }
     let lake_level = refined[outlet].level;
     for &i in &order {
+        budget.checkpoint().await;
         let distance = -refined[i].flow;
         let mouth = lake_level + distance * 0.002;
         refined[i].level = mouth + (refined[i].level - mouth) * smooth((distance - 36.) / 144.);

@@ -18,6 +18,7 @@ mod watershed;
 #[cfg(target_arch = "wasm32")]
 mod web;
 mod wind;
+mod work_budget;
 mod world;
 
 use bevy::platform::time::Instant;
@@ -201,12 +202,7 @@ fn main() {
                 .set(WindowPlugin {
                     primary_window: Some(Window {
                         title: "Map Generation Lab".into(),
-                        resolution: {
-                            let resolution = bevy::window::WindowResolution::new(1280, 800);
-                            #[cfg(target_arch = "wasm32")]
-                            let resolution = resolution.with_scale_factor_override(1.0);
-                            resolution
-                        },
+                        resolution: bevy::window::WindowResolution::new(1280, 800),
                         #[cfg(target_arch = "wasm32")]
                         canvas: Some("#map-canvas".into()),
                         #[cfg(target_arch = "wasm32")]
@@ -272,7 +268,9 @@ fn main() {
                 .chain(),
         );
     #[cfg(target_arch = "wasm32")]
-    app.add_systems(Update, web::ready.after(animals::prepare));
+    app.add_systems(Startup, web::setup_render.after(streaming::setup))
+        .add_systems(PreUpdate, web::resize_render)
+        .add_systems(Update, web::ready.after(animals::prepare));
     if stream_smoke {
         std::fs::create_dir_all(format!("captures/stream-seed-{seed}"))
             .expect("Cannot create captures directory");

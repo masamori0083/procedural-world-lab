@@ -17,7 +17,9 @@ Animated horse, deer, alpaca and wolf models are included for the browser demo a
 
 [Try the map in your browser](https://masamori0083.github.io/procedural-world-lab/). Click **Explore**, then click the map to capture the mouse. A desktop browser with WebGPU and hardware acceleration is required. Use the seed field to generate another world.
 
-The browser keeps nine chunks nearby, compared with 49 on desktop. CPU/process memory and GPU usage are unavailable in the browser; FPS and generated mesh estimates still work. Animal models and animations are shared with the desktop app.
+The browser keeps nine chunks nearby, compared with 49 on desktop. Generation and LOD jobs yield to the browser between small batches, aiming for 2 ms of work per slice. The 3D view renders at CSS-pixel resolution, capped at 1280×720; the HUD retains the canvas resolution. Animal models and animations are shared with the desktop app.
+
+The status line shows FPS, generated mesh estimates, the last two seconds' frame p95, and the largest generation slice since the previous status update. These are elapsed times, not GPU timings or CPU utilization. Process memory and GPU usage are unavailable in the browser.
 
 To build and preview locally:
 
@@ -125,6 +127,7 @@ src/plant_shapes.rs           Shared generated leaf and grass geometry
 src/vegetation.rs             Tree and grass LOD caches
 src/wind.rs                   Vegetation materials and wind settings
 src/web.rs                    Browser seed and loading status
+src/work_budget.rs            Cooperative browser work and render pixel budget
 web/                          Browser page and controls
 scripts/build_web.sh          Build and package the browser demo
 scripts/web_notices.py        Collect bundled third-party notices
