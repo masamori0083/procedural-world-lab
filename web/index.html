@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Procedural World Lab</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <div><span class="eyebrow">RUST · PROCEDURAL EXPLORATION</span><h1>Procedural World Lab</h1></div>
+    <form id="seed-form"><label for="seed">World seed</label><input id="seed" name="seed" type="number" min="0" max="4294967295" value="42" required><button type="submit">New world</button></form>
+  </header>
+  <main>
+    <div id="viewport">
+      <canvas id="map-canvas" tabindex="0" aria-label="Procedural 3D map. Click to explore; Escape releases the mouse."></canvas>
+      <section id="loading">
+        <h2>A world grown from a seed</h2>
+        <p>Explore rivers, hills and forests. Trees and grass are generated in Rust; animated animals roam the map.</p>
+        <button id="start" type="button">Explore</button>
+        <p id="load-detail" aria-live="polite">Requires a desktop browser with WebGPU.</p>
+      </section>
+    </div>
+    <p id="status" role="status">Choose a seed and start exploring.</p>
+    <details open><summary>Controls &amp; demo details</summary>
+      <p><strong>W / S</strong> Move &nbsp; <strong>A / D + mouse</strong> Turn &nbsp; <strong>Shift</strong> Run &nbsp; <strong>V</strong> First person / follow &nbsp; <strong>B</strong> Overview &nbsp; <strong>Wheel</strong> Zoom &nbsp; <strong>Esc</strong> Release mouse</p>
+      <p><strong>R</strong> Return to start &nbsp; <strong>L</strong> River bank &nbsp; <strong>G</strong> Ford &nbsp; <strong>F3</strong> Resource panel &nbsp; <strong>F4</strong> Map layers</p>
+      <p>This browser demo keeps nine chunks nearby and uses the same animated animal models as the desktop app. Desktop exploration keeps a wider area. CPU / process memory / GPU usage measurements are unavailable in the browser; frame rate and generated mesh estimates remain available.</p>
+    </details>
+  </main>
+  <footer><a href="https://github.com/masamori0083/procedural-world-lab">Source on GitHub</a><span><a href="third-party-notices.txt">Third-party notices</a> · A study project in Rust and Bevy</span></footer>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

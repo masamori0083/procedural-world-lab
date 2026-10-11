@@ -9,6 +9,7 @@ use crate::{
     wind::{Materials, VegetationMaterial},
     world::Grass,
 };
+use bevy::platform::time::Instant;
 use bevy::{
     camera::{ImageRenderTarget, RenderTarget},
     light::NotShadowReceiver,
@@ -18,7 +19,6 @@ use bevy::{
         view::screenshot::{Screenshot, ScreenshotCaptured, save_to_disk},
     },
 };
-use std::time::Instant;
 
 const WARMUP: f64 = 4.;
 const MEASURE: f64 = 5.;

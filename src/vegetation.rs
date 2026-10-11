@@ -1,7 +1,7 @@
 //! Three vegetation mesh levels. Placement and collision never depend on the camera.
 use crate::{streaming::Batch, trees::TreeShape};
+use bevy::platform::time::Instant;
 use bevy::{camera::visibility::VisibilityRange, prelude::*};
-use std::time::Instant;
 
 // Position, normal, color, UVs and separate GPU wind parameters.
 pub const VERTEX_BYTES: usize = 56;

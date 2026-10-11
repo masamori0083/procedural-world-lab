@@ -8,6 +8,7 @@ use crate::{
     vegetation::{self, Blueprint, Levels},
     world::{Grass, TerrainSurface},
 };
+use bevy::platform::time::Instant;
 use bevy::{
     asset::RenderAssetUsages,
     camera::visibility::VisibilityRange,
@@ -19,14 +20,19 @@ use bevy::{
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
-    time::Instant,
 };
 
 pub const VERSION: u32 = 19;
 pub const CHUNK_SIZE: f32 = 96.0;
+#[cfg(not(target_arch = "wasm32"))]
 pub const RADIUS: i32 = 3;
+#[cfg(target_arch = "wasm32")]
+pub const RADIUS: i32 = 1;
 pub const MAX_CHUNKS: usize = ((RADIUS * 2 + 1) * (RADIUS * 2 + 1)) as usize;
+#[cfg(not(target_arch = "wasm32"))]
 const MAX_TASKS: usize = 2;
+#[cfg(target_arch = "wasm32")]
+const MAX_TASKS: usize = 1;
 const SIDE: usize = (CHUNK_SIZE / CELL) as usize + 1;
 const TREE_CELL: f32 = 12.0;
 const LOOKAHEAD_SECONDS: f32 = 2.0;

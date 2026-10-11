@@ -1,18 +1,21 @@
 //! Lightweight, process-local resource readings for the map screen.
 use crate::{LabState, terrain::Meadow};
+use bevy::platform::time::Instant;
 use bevy::{
     diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin},
     prelude::*,
 };
-use std::time::{Duration, Instant};
-#[cfg(not(target_os = "macos"))]
+use std::time::Duration;
+#[cfg(all(not(target_os = "macos"), not(target_arch = "wasm32")))]
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 const MIB: f64 = 1024.0 * 1024.0;
 #[cfg(target_os = "macos")]
 const GPU_NOTE: &str = "N/A (Metal)";
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_arch = "wasm32")))]
 const GPU_NOTE: &str = "N/A (unavailable)";
+#[cfg(target_arch = "wasm32")]
+const GPU_NOTE: &str = "N/A (browser)";
 
 #[derive(Clone, Copy, Default)]
 pub struct ProcessSnapshot {
@@ -21,23 +24,23 @@ pub struct ProcessSnapshot {
 }
 
 pub struct ProcessSampler {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), not(target_arch = "wasm32")))]
     system: System,
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), not(target_arch = "wasm32")))]
     pid: Option<Pid>,
 }
 
 impl ProcessSampler {
     pub fn new() -> Self {
         Self {
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(all(not(target_os = "macos"), not(target_arch = "wasm32")))]
             system: System::new(),
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(all(not(target_os = "macos"), not(target_arch = "wasm32")))]
             pid: sysinfo::get_current_pid().ok(),
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), not(target_arch = "wasm32")))]
     fn refresh(&mut self) {
         if let Some(pid) = self.pid {
             self.system.refresh_processes_specifics(
@@ -49,11 +52,15 @@ impl ProcessSampler {
     }
 
     pub fn snapshot(&mut self) -> Option<ProcessSnapshot> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            None
+        }
         #[cfg(target_os = "macos")]
         {
             macos_snapshot()
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(all(not(target_os = "macos"), not(target_arch = "wasm32")))]
         {
             self.refresh();
             self.pid
@@ -136,7 +143,7 @@ impl ResourceMonitor {
             latest,
             last_sample: Instant::now(),
             cpu_percent: None,
-            visible: true,
+            visible: !cfg!(target_arch = "wasm32"),
         }
     }
 }
@@ -147,6 +154,11 @@ pub struct ResourcePanel;
 pub fn setup(mut commands: Commands) {
     commands.spawn((
         ResourcePanel,
+        if cfg!(target_arch = "wasm32") {
+            Visibility::Hidden
+        } else {
+            Visibility::Inherited
+        },
         Text::new("RESOURCE MONITOR\nSampling process CPU..."),
         TextFont {
             font_size: FontSize::Px(15.0),

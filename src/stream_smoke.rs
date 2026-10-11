@@ -6,12 +6,12 @@ use crate::{
     streaming::{ChunkKey, MAX_CHUNKS, StreamWorld},
     terrain::Meadow,
 };
+use bevy::platform::time::Instant;
 use bevy::{
     prelude::*,
     render::view::screenshot::{Screenshot, ScreenshotCaptured, save_to_disk},
     window::PrimaryWindow,
 };
-use std::time::Instant;
 #[derive(Resource)]
 pub struct StreamSmoke {
     start: Instant,

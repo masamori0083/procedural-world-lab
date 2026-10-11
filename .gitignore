@@ -10,8 +10,9 @@
 *.pem
 *.key
 
-# Keep models and internal working documents local.
-/assets/models/
+/dist/
+
+# Keep internal working documents and experiments local.
 /docs/
 /PROJECT_CONTEXT.md
 /AGENTS.md

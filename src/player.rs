@@ -160,6 +160,7 @@ pub fn controls(
     mut rig: ResMut<CameraRig>,
     window: Single<(&Window, &mut CursorOptions), With<PrimaryWindow>>,
     horse: Single<(&mut Transform, &mut HorseController)>,
+    #[cfg(target_arch = "wasm32")] mut capture_grace: Local<f32>,
 ) {
     let (window, mut cursor) = window.into_inner();
     let (mut transform, mut horse) = horse.into_inner();
@@ -168,12 +169,36 @@ pub fn controls(
     } else if buttons.just_pressed(MouseButton::Left) {
         rig.captured = true;
     }
-    cursor.visible = !rig.captured;
-    cursor.grab_mode = if rig.captured {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if buttons.just_pressed(MouseButton::Left) {
+            *capture_grace = 0.5;
+        } else {
+            *capture_grace = (*capture_grace - time.delta_secs()).max(0.);
+        }
+        let locked = web_sys::window()
+            .and_then(|w| w.document())
+            .is_some_and(|document| document.pointer_lock_element().is_some());
+        // Escape/browser UI can release pointer lock without a canvas key event.
+        // A short grace period lets an asynchronous click request complete.
+        if rig.captured && !locked && *capture_grace == 0. {
+            rig.captured = false;
+        }
+    }
+    let visible = !rig.captured;
+    let grab = if rig.captured {
         CursorGrabMode::Locked
     } else {
         CursorGrabMode::None
     };
+    // Winit retries pointer lock on Changed<CursorOptions>, even when the mode
+    // is unchanged. Do not issue another browser request on every frame.
+    if cursor.visible != visible {
+        cursor.visible = visible;
+    }
+    if cursor.grab_mode != grab {
+        cursor.grab_mode = grab;
+    }
     if !window.focused {
         horse.speed = 0.0;
         return;
@@ -440,6 +465,21 @@ pub fn update_hud(
         "Click to explore / resume"
     };
     if let Some(stream) = stream {
+        if cfg!(target_arch = "wasm32") {
+            hud.0 = format!(
+                "{view} | {status}\nSeed {} | {:.0}, {:.0} m | {:.1} m/s\nChunks {}/{} | F3 resources | F4 layers",
+                world.seed,
+                position.translation.x,
+                position.translation.z,
+                horse.speed.abs(),
+                stream.loaded_count(),
+                crate::streaming::MAX_CHUNKS,
+            );
+            if *layer != crate::environment::MapLayer::Natural {
+                hud.0.push_str(&format!("\n{}", layer.legend()));
+            }
+            return;
+        }
         let (tree_lod, grass_lod) = stream.lod_counts();
         let (vertices, full) = stream.vegetation_vertices();
         let terrain_lod = stream.terrain_lod_counts();
@@ -594,6 +634,31 @@ mod tests {
             }
             app.update();
         }
+    }
+
+    #[derive(Resource, Default)]
+    struct CursorChanges(usize);
+
+    #[test]
+    fn stable_capture_does_not_request_pointer_lock_every_frame() {
+        let (mut app, _) = scene_with(Meadow::streamed(
+            42,
+            crate::terrain::TerrainSettings::default(),
+        ));
+        app.init_resource::<CursorChanges>().add_systems(
+            Update,
+            (|query: Query<&CursorOptions, Changed<CursorOptions>>,
+              mut changes: ResMut<CursorChanges>| {
+                changes.0 += query.iter().count();
+            })
+            .after(controls),
+        );
+        app.update();
+        app.world_mut().resource_mut::<CursorChanges>().0 = 0;
+        frames(&mut app, 5, &[]);
+        assert_eq!(app.world().resource::<CursorChanges>().0, 0);
+        frames(&mut app, 1, &[KeyCode::Escape]);
+        assert_eq!(app.world().resource::<CursorChanges>().0, 1);
     }
 
     #[test]

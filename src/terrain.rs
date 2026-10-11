@@ -1,8 +1,8 @@
 use crate::environment::{EnvironmentSample, MapLayer};
+use bevy::platform::time::Instant;
 use bevy::{
     asset::RenderAssetUsages, mesh::Indices, prelude::*, render::render_resource::PrimitiveTopology,
 };
-use std::time::Instant;
 
 pub const EXTENT: f32 = 320.0;
 pub const CELL: f32 = 2.0;

@@ -1,0 +1,8 @@
+Animal models: Horse, Horse_White, Deer, Alpaca, Wolf
+Quaternius — Ultimate Animated Animal Pack
+https://quaternius.com/packs/ultimateanimatedanimals.html
+CC0 1.0 Universal
+https://creativecommons.org/publicdomain/zero/1.0/
+
+The animal files were supplied for this study project. Their use in the browser
+and desktop distributions was confirmed by the project owner.

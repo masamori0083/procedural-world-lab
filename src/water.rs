@@ -19,7 +19,7 @@ pub fn setup(
     mut images: ResMut<Assets<Image>>,
     mut lab: ResMut<crate::LabState>,
 ) {
-    let start = std::time::Instant::now();
+    let start = bevy::platform::time::Instant::now();
     let mut data = Vec::with_capacity(128 * 128 * 4);
     for y in 0..128 {
         for x in 0..128 {

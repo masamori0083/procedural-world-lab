@@ -11,15 +11,24 @@ git clone https://github.com/masamori0083/procedural-world-lab.git
 cd procedural-world-lab
 ```
 
-Animal models are not included. Put these self-contained glTF files, with embedded buffers and textures, in `assets/models/`:
+Animated horse, deer, alpaca and wolf models are included for the browser demo and desktop app. Vegetation shapes and textures are generated in Rust. See [asset details](assets/README.md).
 
-- `Horse.gltf`
-- `Horse_White.gltf`
-- `Deer.gltf`
-- `Alpaca.gltf`
-- `Wolf.gltf`
+## Browser demo
 
-See [asset details](assets/README.md) for model setup and source information.
+[Try the map in your browser](https://masamori0083.github.io/procedural-world-lab/). Click **Explore**, then click the map to capture the mouse. A desktop browser with WebGPU and hardware acceleration is required. Use the seed field to generate another world.
+
+The browser keeps nine chunks nearby, compared with 49 on desktop. CPU/process memory and GPU usage are unavailable in the browser; FPS and generated mesh estimates still work. Animal models and animations are shared with the desktop app.
+
+To build and preview locally:
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.126 --locked
+scripts/build_web.sh
+python3 -m http.server 8080 --directory dist
+```
+
+Open `http://localhost:8080`. The GitHub Actions workflow builds and deploys `dist/` to GitHub Pages after a push to `main`. The CLI version must match the wasm-bindgen version in `Cargo.lock`. Third-party notices for the distributed browser binary are collected during the build.
 
 ## Run
 
@@ -115,11 +124,16 @@ src/grassfield.rs             Seeded meadow patches
 src/plant_shapes.rs           Shared generated leaf and grass geometry
 src/vegetation.rs             Tree and grass LOD caches
 src/wind.rs                   Vegetation materials and wind settings
+src/web.rs                    Browser seed and loading status
+web/                          Browser page and controls
+scripts/build_web.sh          Build and package the browser demo
+scripts/web_notices.py        Collect bundled third-party notices
+.github/workflows/web.yml     GitHub Pages build and deployment
 src/map_profile.rs            Actual-map rendering comparisons
 src/player.rs                 Horse movement and camera controls
 src/animals.rs                Peaceful wildlife
 assets/shaders/               Vegetation rendering shader
-assets/models/                Locally supplied animal models
+assets/models/                Shared animated animal models
 assets/README.md              Asset setup and source details
 Cargo.toml                    Rust package and dependencies
 Cargo.lock                    Locked dependency versions
@@ -134,3 +148,4 @@ Cargo.lock                    Locked dependency versions
 | `captures/stream-seed-<seed>/` | Streaming screenshots. |
 | `captures/map-profile/` | Rendering comparison images. |
 | `target/` | Cargo build output. |
+| `dist/` | Browser build, assets and third-party notices; excluded from source control. |

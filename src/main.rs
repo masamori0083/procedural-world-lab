@@ -15,11 +15,13 @@ mod trees;
 mod vegetation;
 mod water;
 mod watershed;
+#[cfg(target_arch = "wasm32")]
+mod web;
 mod wind;
 mod world;
 
+use bevy::platform::time::Instant;
 use bevy::{diagnostic::FrameTimeDiagnosticsPlugin, prelude::*};
-use std::time::Instant;
 
 #[derive(Resource, Default)]
 pub struct LabState {
@@ -31,7 +33,10 @@ pub struct LabState {
 }
 
 fn main() {
+    #[cfg(not(target_arch = "wasm32"))]
     let args: Vec<String> = std::env::args().collect();
+    #[cfg(target_arch = "wasm32")]
+    let args = web::args();
     let seed = args
         .windows(2)
         .find(|p| p[0] == "--seed")
@@ -186,13 +191,28 @@ fn main() {
         .add_plugins(
             DefaultPlugins
                 .set(AssetPlugin {
-                    file_path: format!("{}/assets", env!("CARGO_MANIFEST_DIR")),
+                    file_path: if cfg!(target_arch = "wasm32") {
+                        "assets".into()
+                    } else {
+                        format!("{}/assets", env!("CARGO_MANIFEST_DIR"))
+                    },
                     ..default()
                 })
                 .set(WindowPlugin {
                     primary_window: Some(Window {
                         title: "Map Generation Lab".into(),
-                        resolution: (1280, 800).into(),
+                        resolution: {
+                            let resolution = bevy::window::WindowResolution::new(1280, 800);
+                            #[cfg(target_arch = "wasm32")]
+                            let resolution = resolution.with_scale_factor_override(1.0);
+                            resolution
+                        },
+                        #[cfg(target_arch = "wasm32")]
+                        canvas: Some("#map-canvas".into()),
+                        #[cfg(target_arch = "wasm32")]
+                        fit_canvas_to_parent: true,
+                        #[cfg(target_arch = "wasm32")]
+                        prevent_default_event_handling: true,
                         ..default()
                     }),
                     ..default()
@@ -251,6 +271,8 @@ fn main() {
             )
                 .chain(),
         );
+    #[cfg(target_arch = "wasm32")]
+    app.add_systems(Update, web::ready.after(animals::prepare));
     if stream_smoke {
         std::fs::create_dir_all(format!("captures/stream-seed-{seed}"))
             .expect("Cannot create captures directory");

@@ -5,8 +5,17 @@ edition = "2024"
 
 [dependencies]
 bevy = { version = "=0.19.0", default-features = false, features = ["3d", "ui", "jpeg"] }
+
+[features]
+web = ["bevy/webgpu", "bevy/web"]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 sysinfo = "=0.38.4"
 libc = "=0.2.186"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "=0.2.126"
+web-sys = { version = "=0.3.103", features = ["Window", "Location", "Document", "Element"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mach2 = "=0.5.0"
@@ -14,3 +23,10 @@ mach2 = "=0.5.0"
 [profile.dev]
 opt-level = 1
 debug = 0
+
+[profile.web-release]
+inherits = "release"
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

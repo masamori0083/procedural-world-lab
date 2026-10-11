@@ -8,12 +8,12 @@ use crate::{
     terrain::Meadow,
     world::{Grass, TerrainSurface},
 };
+use bevy::platform::time::Instant;
 use bevy::{
     prelude::*,
     render::view::screenshot::{Screenshot, ScreenshotCaptured, save_to_disk},
     window::PrimaryWindow,
 };
-use std::time::Instant;
 
 type CameraEntities = (
     With<FollowCamera>,
