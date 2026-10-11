@@ -129,6 +129,14 @@ pub struct TreeShape {
     pub landmark: Option<LandmarkForm>,
 }
 impl TreeShape {
+    pub(crate) fn foliage_wind_amplitude(&self, detail: crate::vegetation::Detail) -> f32 {
+        if self.species == Species::Conifer || detail == crate::vegetation::Detail::Far {
+            0.
+        } else {
+            0.045
+        }
+    }
+
     pub fn at(world: &Meadow, p: Vec2, size: f32, settings: TreeSettings) -> Self {
         // Position-based identity survives changes to traversal/spawn order.
         let seed = mix(world.seed ^ mix(p.x.to_bits()) ^ mix(p.y.to_bits().rotate_left(13)));
@@ -205,7 +213,7 @@ impl TreeShape {
                     angle,
                     random.range(-0.20, 0.20) * v,
                 ),
-                shade: 1.0 + random.range(-0.055, 0.055) * v,
+                shade: 1.0 + random.range(-0.10, 0.10) * v,
             });
             let start = trunk[2 + i % 2].0;
             let end = center - Vec3::Y * vertical * bulk * size * 0.22;
@@ -337,11 +345,16 @@ impl TreeShape {
         tree
     }
 
+    #[cfg(test)]
     pub fn wood_mesh(&self) -> Mesh {
-        self.wood_mesh_lod(crate::vegetation::Detail::Near)
+        self.wood_mesh_detail(crate::vegetation::Detail::Near, false)
     }
 
     pub fn wood_mesh_lod(&self, detail: crate::vegetation::Detail) -> Mesh {
+        self.wood_mesh_detail(detail, true)
+    }
+
+    fn wood_mesh_detail(&self, detail: crate::vegetation::Detail, refined: bool) -> Mesh {
         use crate::vegetation::Detail;
         let mut surface = TreeSurface::default();
         let sides = match detail {
@@ -350,8 +363,23 @@ impl TreeShape {
             Detail::Far => 3,
         };
         // Keep the full trunk path: bent landmark silhouettes must survive simplification.
-        surface.tube(&self.trunk, self.bark_color, sides);
-        if detail != Detail::Far || self.landmark.is_some() {
+        let conifer = refined && self.species == Species::Conifer;
+        if conifer {
+            // Expose the short lower stem only. The crown has its own opaque
+            // foliage interior, so brown wood cannot show between its boughs.
+            let (base, radius) = self.conifer_crown_base();
+            let mut stem: Vec<_> = self
+                .trunk
+                .iter()
+                .copied()
+                .filter(|(p, _)| p.y < base.y)
+                .collect();
+            stem.push((base, radius));
+            surface.tube(&stem, self.bark_color, sides);
+        } else {
+            surface.tube(&self.trunk, self.bark_color, sides);
+        }
+        if !conifer && (detail != Detail::Far || self.landmark.is_some()) {
             for branch in &self.branches {
                 if detail == Detail::Near {
                     surface.tube(branch, self.bark_color * 0.96, 7);
@@ -380,13 +408,19 @@ impl TreeShape {
             let r = (rotation.x_axis.abs() * leaf.radii.x
                 + rotation.y_axis.abs() * leaf.radii.y
                 + rotation.z_axis.abs() * leaf.radii.z)
-                * (1. + self.roughness);
+                * (1. + self.roughness)
+                * if self.species == Species::Conifer {
+                    1.
+                } else {
+                    1.7
+                };
             lo = lo.min(leaf.center - r);
             hi = hi.max(leaf.center + r);
         }
         ((lo + hi) * 0.5, (hi - lo).length())
     }
 
+    #[cfg(test)]
     pub fn full_crown_vertices(&self) -> usize {
         self.leaves.len()
             * if self.species == Species::Conifer {
@@ -396,6 +430,260 @@ impl TreeShape {
             }
     }
 
+    /// Exact Near vertex budget for streaming foliage, including conifer boughs.
+    pub fn full_foliage_vertices(&self) -> usize {
+        let boughs = self.leaves.len()
+            * if self.species == Species::Conifer {
+                4824
+            } else {
+                1440
+            };
+        boughs
+            + if self.species == Species::Conifer {
+                6 * (self.leaves.len() + 2) * 16 + 24 * 8 * 24
+            } else {
+                0
+            }
+    }
+    pub fn foliage_mesh(&self, detail: crate::vegetation::Detail) -> Mesh {
+        if self.species == Species::Conifer {
+            return self.conifer_foliage(detail);
+        }
+        let mut foliage = crate::plant_shapes::Geometry::default();
+        let color =
+            Color::srgb(self.leaf_color.x, self.leaf_color.y, self.leaf_color.z).to_linear();
+        for (i, leaf) in self.leaves.iter().enumerate() {
+            let mut random =
+                crate::plant_shapes::Random(u64::from(self.seed) ^ (i as u64 * 67 + 0xc419_a733));
+            let levels = crate::plant_shapes::leaf_cluster(
+                &mut random,
+                leaf.center - self.crown_pivot,
+                leaf.radii,
+                leaf.rotation,
+                Vec3::new(color.red, color.green, color.blue) * leaf.shade,
+            );
+            foliage.append(levels.into_iter().nth(detail.index()).unwrap());
+        }
+        foliage.mesh()
+    }
+    /// All levels retain all seeded boughs. Middle simplifies lateral sprays
+    /// instead of dropping whole branches and opening holes in the crown.
+    fn conifer_foliage(&self, detail: crate::vegetation::Detail) -> Mesh {
+        use crate::vegetation::Detail;
+        let near = detail == Detail::Near;
+        let far = detail == Detail::Far;
+        let mut surface = TreeSurface::default();
+        for (tier, leaf) in self.leaves.iter().enumerate() {
+            for ring in 0..5 {
+                for side in 0..8 {
+                    let mut random = SeedRandom(mix(
+                        self.seed ^ (0x711c_45ab + tier as u32 * 67 + ring * 13 + side)
+                    ));
+                    let variation = self.roughness / 0.09;
+                    let angle = side as f32 * std::f32::consts::TAU / 8.
+                        + ring as f32 * 0.73
+                        + random.range(-0.18, 0.18) * variation;
+                    let radial = Vec3::new(angle.cos(), 0., angle.sin());
+                    let across = Vec3::new(-angle.sin(), 0., angle.cos());
+                    let f = ring as f32 / 4.;
+                    let reach = (0.94 - f * 0.50) * random.range(0.84, 1.0);
+                    let y = -0.35 + f * 1.10 + random.range(-0.10, 0.10) * variation;
+                    let axis = (radial - Vec3::Y * 0.22).normalize();
+                    let color = self.leaf_color * leaf.shade * random.range(0.95, 1.08);
+                    {
+                        // A long central spray and two pairs of lateral sprays
+                        // form a flat evergreen bough with a serrated outline.
+                        // Near uses all five volumes; Middle keeps the central
+                        // spray and the outer pair with simpler closed faces.
+                        let central = if far {
+                            TreeSurface::needle_bundle_simple
+                        } else {
+                            TreeSurface::needle_bundle
+                        };
+                        central(
+                            &mut surface,
+                            radial * reach * 0.42 + Vec3::Y * (y - 0.055),
+                            axis,
+                            reach * 0.48,
+                            reach * 0.16,
+                            color * 0.96,
+                            leaf,
+                            self.crown_pivot,
+                        );
+                        for (pair, fraction) in [0.30, 0.62].into_iter().enumerate() {
+                            for sign in [-1., 1.] {
+                                let length = reach * if pair == 0 { 0.34 } else { 0.26 };
+                                let spread = reach * if pair == 0 { 0.12 } else { 0.10 };
+                                let jitter = random.range(-0.025, 0.025) * variation;
+                                let shade = random.range(0.96, 1.06);
+                                // Consume the same random sequence at all
+                                // levels; retain the outer pair's seeded tips.
+                                if !near && pair == 0 {
+                                    continue;
+                                }
+                                let spray = if near {
+                                    TreeSurface::needle_bundle
+                                } else {
+                                    TreeSurface::needle_bundle_simple
+                                };
+                                spray(
+                                    &mut surface,
+                                    radial * reach * (fraction + jitter)
+                                        + across * sign * spread
+                                        + Vec3::Y * (y - fraction * 0.14),
+                                    (radial + across * sign * 0.60 - Vec3::Y * 0.30).normalize(),
+                                    length,
+                                    reach * 0.13,
+                                    color * shade,
+                                    leaf,
+                                    self.crown_pivot,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            let leader = if far {
+                TreeSurface::needle_bundle_simple
+            } else {
+                TreeSurface::needle_bundle
+            };
+            leader(
+                &mut surface,
+                Vec3::Y * 0.84,
+                Vec3::Y,
+                0.16,
+                0.05,
+                self.leaf_color * leaf.shade * 1.03,
+                leaf,
+                self.crown_pivot,
+            );
+        }
+        self.conifer_interior(
+            &mut surface,
+            if near {
+                16
+            } else if far {
+                3
+            } else {
+                8
+            },
+        );
+        self.conifer_inner_sprays(&mut surface, detail);
+        surface.mesh()
+    }
+
+    /// The lowest foliage begins above the exposed stem. Interpolate the
+    /// existing trunk path so a bent tree's stem meets its crown without a gap.
+    fn conifer_crown_base(&self) -> (Vec3, f32) {
+        let leaf = &self.leaves[0];
+        let height = leaf.center.y - leaf.radii.y * 0.75;
+        let pair = self.trunk.windows(2).find(|p| height <= p[1].0.y).unwrap();
+        let f = (height - pair[0].0.y) / (pair[1].0.y - pair[0].0.y);
+        (
+            pair[0].0.lerp(pair[1].0, f),
+            pair[0].1 + (pair[1].1 - pair[0].1) * f,
+        )
+    }
+
+    /// A narrow opaque green interior closes gaps inside the crown only.
+    fn conifer_interior(&self, surface: &mut TreeSurface, sides: usize) {
+        let first = self.leaves.first().expect("conifer crown");
+        let last = self.leaves.last().unwrap();
+        let mut path = vec![(
+            self.conifer_crown_base().0 - self.crown_pivot,
+            first.radii.x.min(first.radii.z) * 0.25,
+        )];
+        path.extend(self.leaves.iter().map(|leaf| {
+            (
+                leaf.center - self.crown_pivot,
+                leaf.radii.x.min(leaf.radii.z) * 0.18,
+            )
+        }));
+        path.push((
+            last.center + last.rotation * Vec3::Y * last.radii.y - self.crown_pivot,
+            last.radii.x.min(last.radii.z) * 0.006,
+        ));
+        surface.tube(&path, self.leaf_color * 0.88, sides);
+    }
+
+    /// Closely spaced sprays fill a broad lower crown and taper to the leader.
+    /// Middle retains every root with simpler sprays. Leave the lower stem free.
+    fn conifer_inner_sprays(&self, surface: &mut TreeSurface, detail: crate::vegetation::Detail) {
+        use crate::vegetation::Detail;
+        let near = detail == Detail::Near;
+        let first = &self.leaves[0];
+        let last = self.leaves.last().unwrap();
+        let tip = last.center + last.rotation * Vec3::Y * last.radii.y;
+        let unit = LeafCluster {
+            center: Vec3::ZERO,
+            radii: Vec3::ONE,
+            rotation: Quat::IDENTITY,
+            shade: 1.,
+        };
+        let base = self.conifer_crown_base().0;
+        let mut spine = vec![base];
+        spine.extend(self.leaves.iter().map(|leaf| leaf.center));
+        spine.push(tip);
+        for layer in (0..24).step_by(if detail == Detail::Far { 2 } else { 1 }) {
+            let f = (layer as f32 + 0.5) / 24.;
+            let reach = first.radii.x.min(first.radii.z) * 0.95 * (1. - f).powf(0.85).max(0.06);
+            let length = reach * 0.70;
+            let height = base.y + (tip.y - base.y) * f;
+            // Follow the same bent crown centerline as the opaque interior.
+            let pair = spine.windows(2).find(|p| height <= p[1].y).unwrap();
+            let center = pair[0].lerp(pair[1], (height - pair[0].y) / (pair[1].y - pair[0].y));
+            for side in 0..8 {
+                let mut random = SeedRandom(mix(self.seed ^ (0x316b_ada2 + layer * 17 + side)));
+                let angle = side as f32 * std::f32::consts::TAU / 8.
+                    + layer as f32 * 0.71
+                    + random.range(-0.12, 0.12);
+                let radial = Vec3::new(angle.cos(), 0., angle.sin());
+                let mut root = center + radial * reach * 0.35;
+                // Keep the lowest sprays above the exposed stem.
+                root.y = root.y.max(base.y + length * 0.65 + reach * 0.15);
+                let spray = if near {
+                    TreeSurface::needle_bundle
+                } else {
+                    TreeSurface::needle_bundle_simple
+                };
+                spray(
+                    surface,
+                    root,
+                    (radial - Vec3::Y * 0.80).normalize(),
+                    length,
+                    reach * 0.27,
+                    self.leaf_color * random.range(0.88, 1.02),
+                    &unit,
+                    self.crown_pivot,
+                );
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn conifer_mesh(&self, sides: usize) -> Mesh {
+        let mut surface = TreeSurface::default();
+        for leaf in &self.leaves {
+            let transform =
+                |v: Vec3| leaf.center - self.crown_pivot + leaf.rotation * (v * leaf.radii);
+            let tip = transform(Vec3::Y);
+            let base = transform(-Vec3::Y);
+            for side in 0..sides {
+                let point = |i: usize| {
+                    let a = i as f32 * std::f32::consts::TAU / sides as f32;
+                    transform(Vec3::new(a.cos(), -1., a.sin()))
+                };
+                let a = point(side);
+                let b = point((side + 1) % sides);
+                surface.triangle(a, tip, b, self.leaf_color * leaf.shade);
+                surface.triangle(a, b, base, self.leaf_color * leaf.shade * 0.92);
+            }
+        }
+        surface.mesh()
+    }
+
+    #[cfg(test)]
     pub fn crown_mesh(&self, unit: &Mesh) -> Mesh {
         use bevy::mesh::VertexAttributeValues;
         let Some(VertexAttributeValues::Float32x3(vertices)) =
@@ -411,24 +699,7 @@ impl TreeShape {
             } else {
                 4
             };
-            let mut surface = TreeSurface::default();
-            for leaf in &self.leaves {
-                let transform =
-                    |v: Vec3| leaf.center - self.crown_pivot + leaf.rotation * (v * leaf.radii);
-                let tip = transform(Vec3::Y);
-                let base = transform(-Vec3::Y);
-                for side in 0..sides {
-                    let point = |i: usize| {
-                        let a = i as f32 * std::f32::consts::TAU / sides as f32;
-                        transform(Vec3::new(a.cos(), -1., a.sin()))
-                    };
-                    let a = point(side);
-                    let b = point((side + 1) % sides);
-                    surface.triangle(a, tip, b, self.leaf_color * leaf.shade);
-                    surface.triangle(a, b, base, self.leaf_color * leaf.shade * 0.92);
-                }
-            }
-            return surface.mesh();
+            return self.conifer_mesh(sides);
         }
         let indices: Vec<_> = unit.indices().unwrap().iter().collect();
         let mut surface = TreeSurface::default();
@@ -471,6 +742,109 @@ impl TreeSurface {
         let color = Color::srgb(srgb.x, srgb.y, srgb.z).to_linear();
         self.colors
             .extend([[color.red, color.green, color.blue, 1.0]; 3]);
+    }
+    /// Four closed faces preserve a spray's length and width at Middle LOD.
+    /// This keeps every inner root, with half the geometry of the Near spray.
+    #[allow(clippy::too_many_arguments)]
+    fn needle_bundle_simple(
+        &mut self,
+        center: Vec3,
+        axis: Vec3,
+        length: f32,
+        width: f32,
+        color: Vec3,
+        leaf: &LeafCluster,
+        pivot: Vec3,
+    ) {
+        let reference = if axis.y.abs() < 0.9 { Vec3::Y } else { Vec3::X };
+        let across = axis.cross(reference).normalize();
+        let up = across.cross(axis).normalize();
+        let points = [
+            center - axis * length * 0.65,
+            center + axis * length,
+            // These points lie ON the Near diamond, rather than at the two
+            // lower box corners outside it. Simplification cannot grow a leaf.
+            center + across * width * 0.70 - up * width * 0.52 * 0.30,
+            center - across * width * 0.70 - up * width * 0.52 * 0.30,
+        ];
+        let centroid = points.iter().sum::<Vec3>() / 4.;
+        let normals = points.map(|p| (leaf.rotation * ((p - centroid) / leaf.radii)).normalize());
+        let transform = |p: Vec3| leaf.center - pivot + leaf.rotation * (p * leaf.radii);
+        for [a, mut b, mut c] in [[0, 1, 2], [0, 3, 1], [0, 2, 3], [1, 3, 2]] {
+            let face = (points[b] - points[a]).cross(points[c] - points[a]);
+            if face.dot((points[a] + points[b] + points[c]) / 3. - centroid) < 0. {
+                std::mem::swap(&mut b, &mut c);
+            }
+            self.triangle(
+                transform(points[a]),
+                transform(points[b]),
+                transform(points[c]),
+                color,
+            );
+            let end = self.normals.len();
+            // A thin tetrahedron's centroid normals can point through a face.
+            // Keep the soft shading in its outward hemisphere after scaling.
+            let face_normal = Vec3::from(self.normals[end - 1]);
+            let outward_normal = |normal: Vec3| {
+                (normal + face_normal * (0.15 - normal.dot(face_normal)).max(0.)).normalize()
+            };
+            self.normals[end - 3..].copy_from_slice(&[
+                outward_normal(normals[a]).to_array(),
+                outward_normal(normals[b]).to_array(),
+                outward_normal(normals[c]).to_array(),
+            ]);
+        }
+    }
+    /// A pointed, narrow volume represents a small spray of evergreen needles.
+    /// Soft normals avoid eight hard-looking faces; the underside stays darker.
+    #[allow(clippy::too_many_arguments)]
+    fn needle_bundle(
+        &mut self,
+        center: Vec3,
+        axis: Vec3,
+        length: f32,
+        width: f32,
+        color: Vec3,
+        leaf: &LeafCluster,
+        pivot: Vec3,
+    ) {
+        let reference = if axis.y.abs() < 0.9 { Vec3::Y } else { Vec3::X };
+        let across = axis.cross(reference).normalize();
+        let up = across.cross(axis).normalize();
+        let points = [
+            center - axis * length * 0.65,
+            center + axis * length,
+            center + across * width,
+            center - across * width,
+            center + up * width * 0.52,
+            center - up * width * 0.52,
+        ];
+        let normals = [-axis, axis, across, -across, up, -up]
+            .map(|n| (leaf.rotation * (n / leaf.radii)).normalize());
+        let transform = |p: Vec3| leaf.center - pivot + leaf.rotation * (p * leaf.radii);
+        for [a, b, c] in [
+            [0, 2, 4],
+            [0, 4, 3],
+            [1, 4, 2],
+            [1, 3, 4],
+            [0, 5, 2],
+            [0, 3, 5],
+            [1, 2, 5],
+            [1, 5, 3],
+        ] {
+            self.triangle(
+                transform(points[a]),
+                transform(points[b]),
+                transform(points[c]),
+                color * if b == 5 || c == 5 { 0.83 } else { 1. },
+            );
+            let end = self.normals.len();
+            self.normals[end - 3..].copy_from_slice(&[
+                normals[a].to_array(),
+                normals[b].to_array(),
+                normals[c].to_array(),
+            ]);
+        }
     }
     fn tube(&mut self, path: &[(Vec3, f32)], color: Vec3, sides: usize) {
         let axis = (path.last().unwrap().0 - path[0].0).normalize();
@@ -524,6 +898,313 @@ pub fn shapes(world: &Meadow, settings: TreeSettings) -> Vec<TreeShape> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn simplified_needles_stay_inside_the_detailed_spray() {
+        use bevy::mesh::VertexAttributeValues;
+        let leaf = LeafCluster {
+            center: Vec3::ZERO,
+            radii: Vec3::ONE,
+            rotation: Quat::IDENTITY,
+            shade: 1.,
+        };
+        let mut surface = TreeSurface::default();
+        surface.needle_bundle_simple(Vec3::ZERO, Vec3::Z, 1., 1., Vec3::ONE, &leaf, Vec3::ZERO);
+        let mesh = surface.mesh();
+        let Some(VertexAttributeValues::Float32x3(points)) =
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+        else {
+            panic!()
+        };
+        // Near is a diamond cross section, tapering to its two axial endpoints.
+        for p in points {
+            let p = Vec3::from(*p);
+            let available = if p.z >= 0. { 1. - p.z } else { 1. + p.z / 0.65 };
+            assert!(
+                p.x.abs() + p.y.abs() / 0.52 <= available + 0.0001,
+                "simplified spray protrudes beyond the detailed volume: {p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn far_conifer_keeps_the_middle_bough_roots_and_tips() {
+        use crate::vegetation::Detail;
+        use bevy::mesh::VertexAttributeValues;
+        let world = Meadow::streamed(42, crate::terrain::TerrainSettings::default());
+        let tree = (0..2000)
+            .map(|i| {
+                TreeShape::at(
+                    &world,
+                    Vec2::new(i as f32 * 3., 27.),
+                    1.,
+                    TreeSettings::default(),
+                )
+            })
+            .find(|tree| tree.species == Species::Conifer)
+            .unwrap();
+        let middle = tree.foliage_mesh(Detail::Middle);
+        let far = tree.foliage_mesh(Detail::Far);
+        let Some(VertexAttributeValues::Float32x3(m)) = middle.attribute(Mesh::ATTRIBUTE_POSITION)
+        else {
+            panic!()
+        };
+        let Some(VertexAttributeValues::Float32x3(f)) = far.attribute(Mesh::ATTRIBUTE_POSITION)
+        else {
+            panic!()
+        };
+        assert!(
+            f.len() >= tree.leaves.len() * 1452,
+            "Far must retain boughs, not replace them with cones"
+        );
+        for tier in 0..tree.leaves.len() {
+            for bough in 0..40 {
+                let mi = tier * 1944 + bough * 48;
+                let fi = tier * 1452 + bough * 36;
+                assert_eq!(f[fi], m[mi]);
+                assert!(f[fi..fi + 12].contains(&m[mi + 6]));
+                // Outer lateral sprays are exactly retained from Middle.
+                assert_eq!(&f[fi + 12..fi + 36], &m[mi + 24..mi + 48]);
+            }
+        }
+    }
+
+    #[test]
+    fn conifer_sprays_are_repeatable_bounded_and_lod_preserves_the_envelope() {
+        use crate::vegetation::Detail;
+        use bevy::mesh::VertexAttributeValues;
+        let world = Meadow::streamed(42, crate::terrain::TerrainSettings::default());
+        let p = (0..2000)
+            .map(|i| Vec2::new(i as f32 * 3., 27.))
+            .find(|p| {
+                TreeShape::at(&world, *p, 1., TreeSettings::default()).species == Species::Conifer
+            })
+            .unwrap();
+        for variation in [0., 1.] {
+            for isolated in [0., 1.] {
+                let tree = TreeShape::with_isolation(
+                    &world,
+                    p,
+                    1.,
+                    TreeSettings {
+                        variation,
+                        ..default()
+                    },
+                    isolated,
+                );
+                let before = tree.clone();
+                assert_eq!(tree.wood_mesh_lod(Detail::Near).count_vertices(), 126);
+                assert_eq!(tree.wood_mesh().count_vertices(), 714);
+                for (level, per_tier) in [
+                    (Detail::Near, 4824),
+                    (Detail::Middle, 1944),
+                    (Detail::Far, 1452),
+                ] {
+                    let mesh = tree.foliage_mesh(level);
+                    let core_sides = match level {
+                        Detail::Near => 16,
+                        Detail::Middle => 8,
+                        Detail::Far => 3,
+                    };
+                    let bough_vertices = tree.leaves.len() * per_tier;
+                    let inner_sprays = match level {
+                        Detail::Near => 24 * 8 * 24,
+                        Detail::Middle => 24 * 8 * 12,
+                        Detail::Far => 12 * 8 * 12,
+                    };
+                    assert_eq!(
+                        mesh.count_vertices(),
+                        bough_vertices + 6 * (tree.leaves.len() + 2) * core_sides + inner_sprays
+                    );
+                    assert_eq!(
+                        mesh.attribute(Mesh::ATTRIBUTE_POSITION),
+                        tree.foliage_mesh(level).attribute(Mesh::ATTRIBUTE_POSITION)
+                    );
+                    let Some(VertexAttributeValues::Float32x3(points)) =
+                        mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+                    else {
+                        panic!()
+                    };
+                    let Some(VertexAttributeValues::Float32x3(normals)) =
+                        mesh.attribute(Mesh::ATTRIBUTE_NORMAL)
+                    else {
+                        panic!()
+                    };
+                    assert!(
+                        normals
+                            .iter()
+                            .all(|n| (Vec3::from(*n).length() - 1.).abs() < 0.001)
+                    );
+                    for (face, shading) in points.chunks_exact(3).zip(normals.chunks_exact(3)) {
+                        let [a, b, c] = [
+                            Vec3::from(face[0]),
+                            Vec3::from(face[1]),
+                            Vec3::from(face[2]),
+                        ];
+                        let outward = (b - a).cross(c - a).normalize();
+                        let average: Vec3 = shading.iter().map(|n| Vec3::from(*n)).sum();
+                        assert!(
+                            outward.dot(average) > 0.,
+                            "foliage winding disagrees with its normals"
+                        );
+                    }
+                    for (points, leaf) in points[..bough_vertices]
+                        .chunks_exact(per_tier)
+                        .zip(&tree.leaves)
+                    {
+                        let local: Vec<_> = points
+                            .iter()
+                            .map(|p| {
+                                (leaf.rotation.inverse()
+                                    * (Vec3::from(*p) + tree.crown_pivot - leaf.center))
+                                    / leaf.radii
+                            })
+                            .collect();
+                        assert!(
+                            local
+                                .iter()
+                                .all(|p| p.is_finite() && p.abs().max_element() <= 1.001)
+                        );
+                        // All levels retain the leader and stay inside the existing envelope.
+                        assert!(local.iter().any(|p| p.distance(Vec3::Y) < 0.001));
+                    }
+                    // Only the short lower stem is exposed; the filled crown
+                    // meets its top rather than extending foliage to the root.
+                    let (base, radius) = tree.conifer_crown_base();
+                    let stem = tree.wood_mesh_lod(level);
+                    let expected = match level {
+                        Detail::Near => 126,
+                        Detail::Middle => 90,
+                        Detail::Far => 54,
+                    };
+                    assert_eq!(stem.count_vertices(), expected);
+                    let Some(VertexAttributeValues::Float32x3(stem_points)) =
+                        stem.attribute(Mesh::ATTRIBUTE_POSITION)
+                    else {
+                        panic!()
+                    };
+                    assert!(
+                        stem_points
+                            .iter()
+                            .all(|p| Vec3::from(*p).y <= base.y + radius)
+                    );
+                    assert!(
+                        stem_points
+                            .iter()
+                            .any(|p| Vec3::from(*p).distance(base) < 0.001)
+                    );
+                    let core = &points[bough_vertices..];
+                    assert!(
+                        core.iter().any(|p| {
+                            (Vec3::from(*p) + tree.crown_pivot).distance(base) < 0.001
+                        })
+                    );
+                    assert!(
+                        core.iter()
+                            .all(|p| { (Vec3::from(*p) + tree.crown_pivot).y > base.y * 0.5 })
+                    );
+                    let (center, diameter) = tree.bounds();
+                    assert!(core.iter().all(|p| {
+                        (Vec3::from(*p) + tree.crown_pivot).distance(center) <= diameter * 0.5
+                    }));
+                }
+                // Every bough retains its central spray at the exact Near
+                // position. Simplification must not remove alternate branches.
+                let near = tree.foliage_mesh(Detail::Near);
+                let middle = tree.foliage_mesh(Detail::Middle);
+                let vertices = |mesh: &Mesh| {
+                    let Some(VertexAttributeValues::Float32x3(points)) =
+                        mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+                    else {
+                        panic!()
+                    };
+                    points.clone()
+                };
+                let near_points = vertices(&near);
+                let middle_points = vertices(&middle);
+                for tier in 0..tree.leaves.len() {
+                    for bough in 0..40 {
+                        let n = tier * 4824 + bough * 120;
+                        let m = tier * 1944 + bough * 48;
+                        assert_eq!(&near_points[n..n + 24], &middle_points[m..m + 24]);
+                    }
+                }
+                let near_inner = tree.leaves.len() * 4824 + 6 * (tree.leaves.len() + 2) * 16;
+                let middle_inner = tree.leaves.len() * 1944 + 6 * (tree.leaves.len() + 2) * 8;
+                for root in 0..24 * 8 {
+                    let n = near_inner + root * 24;
+                    let m = middle_inner + root * 12;
+                    // All 192 inner spray roots keep their tail and tip, too.
+                    assert_eq!(near_points[n], middle_points[m]);
+                    assert!(middle_points[m..m + 12].contains(&near_points[n + 6]));
+                }
+                // The finite-map crown path retains its original three cones.
+                assert_eq!(
+                    tree.crown_mesh(&Sphere::new(1.).mesh().ico(0).unwrap())
+                        .count_vertices(),
+                    tree.leaves.len() * 36
+                );
+                assert_eq!(tree, before);
+            }
+        }
+    }
+
+    #[test]
+    fn refined_foliage_preserves_identity_and_bounds_with_bounded_cost() {
+        use crate::vegetation::Detail;
+        use bevy::mesh::VertexAttributeValues;
+        for seed in [42, 20261003, 314159] {
+            let world = Meadow::streamed(seed, crate::terrain::TerrainSettings::default());
+            for p in [Vec2::ZERO, Vec2::new(120., -30.), Vec2::new(-170., 90.)] {
+                let tree = TreeShape::at(&world, p, 1., TreeSettings::default());
+                let before = tree.clone();
+                let (center, diameter) = tree.bounds();
+                let original = tree.crown_mesh(&Sphere::new(1.).mesh().ico(1).unwrap());
+                let mut previous = usize::MAX;
+                for detail in [Detail::Near, Detail::Middle, Detail::Far] {
+                    let mesh = tree.foliage_mesh(detail);
+                    assert!(mesh.count_vertices() < previous);
+                    if detail == Detail::Near {
+                        assert_eq!(mesh.count_vertices(), tree.full_foliage_vertices());
+                        if tree.species != Species::Conifer {
+                            assert_eq!(mesh.count_vertices(), tree.leaves.len() * 1440);
+                            assert!(mesh.count_vertices() > original.count_vertices());
+                        } else {
+                            assert!(mesh.count_vertices() <= 20000);
+                        }
+                    }
+                    previous = mesh.count_vertices();
+                    let Some(VertexAttributeValues::Float32x3(points)) =
+                        mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+                    else {
+                        panic!()
+                    };
+                    let Some(VertexAttributeValues::Float32x3(normals)) =
+                        mesh.attribute(Mesh::ATTRIBUTE_NORMAL)
+                    else {
+                        panic!()
+                    };
+                    assert!(
+                        normals
+                            .iter()
+                            .all(|n| (Vec3::from(*n).length() - 1.).abs() < 0.001)
+                    );
+                    assert!(
+                        points
+                            .iter()
+                            .all(|p| (Vec3::from(*p) + tree.crown_pivot).distance(center)
+                                <= diameter * 0.5)
+                    );
+                    assert_eq!(
+                        mesh.attribute(Mesh::ATTRIBUTE_POSITION),
+                        tree.foliage_mesh(detail)
+                            .attribute(Mesh::ATTRIBUTE_POSITION)
+                    );
+                }
+                assert_eq!(tree, before);
+            }
+        }
+    }
     #[test]
     fn habitat_changes_species_probabilities_and_conifer_silhouettes_survive_lod() {
         let count = |height, distance, kind| {

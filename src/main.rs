@@ -1,6 +1,9 @@
 mod animals;
 mod environment;
+mod grassfield;
+mod map_profile;
 mod monitor;
+mod plant_shapes;
 mod player;
 mod river;
 mod smoke;
@@ -12,6 +15,7 @@ mod trees;
 mod vegetation;
 mod water;
 mod watershed;
+mod wind;
 mod world;
 
 use bevy::{diagnostic::FrameTimeDiagnosticsPlugin, prelude::*};
@@ -38,6 +42,7 @@ fn main() {
         .any(|a| a == "--streaming" || a == "--stream-smoke-test");
     let stream_smoke = args.iter().any(|a| a == "--stream-smoke-test");
     let smoke_test = args.iter().any(|a| a == "--smoke-test");
+    let refined_grass = !args.iter().any(|a| a == "--legacy-grass-look");
     let mut settings = trees::TreeSettings::default();
     for (flag, value) in [
         ("--tree-variation", &mut settings.variation),
@@ -66,7 +71,8 @@ fn main() {
                         .unwrap_or(0.65)
                         .clamp(0., 1.),
                 },
-            ),
+            )
+            .with_grass_look(refined_grass),
             settings,
         );
         return;
@@ -90,6 +96,7 @@ fn main() {
     } else {
         terrain::Meadow::new(seed)
     };
+    meadow.set_grass_look(refined_grass);
     if let Some(generator) = meadow.stream_generator() {
         meadow.trees = [
             streaming::ChunkKey(-1, -1),
@@ -192,6 +199,11 @@ fn main() {
                 }),
         )
         .add_plugins(FrameTimeDiagnosticsPlugin::default())
+        .add_plugins(MaterialPlugin::<wind::VegetationMaterial>::default())
+        .insert_resource(wind::Config {
+            enabled: !args.iter().any(|a| a == "--no-vegetation-wind"),
+            fast_grass_shadows: !args.iter().any(|a| a == "--soft-grass-shadows"),
+        })
         .insert_resource(vegetation::LodConfig {
             enabled: !args.iter().any(|a| a == "--no-vegetation-lod"),
         })
@@ -206,6 +218,7 @@ fn main() {
         .add_systems(
             Startup,
             (
+                wind::setup,
                 setup_scene,
                 water::setup,
                 player::setup,
@@ -228,11 +241,13 @@ fn main() {
                 player::follow_camera,
                 world::update_layer,
                 streaming::schedule,
+                streaming::update_grass_shadows,
                 player::update_hud,
                 monitor::update,
                 world::sway_trees,
                 world::drift_clouds,
                 water::animate,
+                wind::animate,
             )
                 .chain(),
         );
@@ -252,7 +267,13 @@ fn main() {
                 .after(monitor::update),
         );
     }
-    app.run();
+    if args.iter().any(|a| a == "--map-profile") {
+        assert!(stream_mode, "--map-profile requires --streaming");
+        map_profile::enable(&mut app, &args);
+    }
+    if let AppExit::Error(code) = app.run() {
+        std::process::exit(i32::from(code.get()));
+    }
 }
 
 fn setup_scene(
@@ -262,10 +283,11 @@ fn setup_scene(
     meshes: ResMut<Assets<Mesh>>,
     materials: ResMut<Assets<StandardMaterial>>,
     mut lab: ResMut<LabState>,
+    plants: Res<wind::Materials>,
 ) {
     let start = Instant::now();
     let timings = world.timings;
-    world::setup(commands, world, settings, meshes, materials);
+    world::setup(commands, world, settings, meshes, materials, plants);
     lab.scene_setup_ms = start.elapsed().as_secs_f64() * 1000.0;
     info!(
         "Map generation: terrain {:.2} ms, CPU scene setup {:.2} ms (excludes GPU upload / model loading)",

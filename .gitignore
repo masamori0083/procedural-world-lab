@@ -19,3 +19,6 @@
 /.codex/
 /scripts/export_source.py
 /assets/model-manifest.json
+/examples/
+/src/conifer_preview.rs
+/assets/shaders/vegetation_study_*.wgsl

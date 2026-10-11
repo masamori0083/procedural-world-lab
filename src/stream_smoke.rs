@@ -210,6 +210,17 @@ pub fn drive(
                 keys.press(KeyCode::KeyG);
             }
             31 => keys.press(KeyCode::KeyB),
+            32 | 35 => {
+                let (p, yaw) = grass_field_view(&world, smoke.stage == 32);
+                horse.0.translation = Vec3::new(p.x, world.ground(p) + 0.025, p.y);
+                horse.1.speed = 0.;
+                horse.1.yaw = yaw;
+                horse.0.rotation = Quat::from_rotation_y(yaw);
+                *rig = CameraRig::default();
+                rig.captured = true;
+            }
+            33 => keys.press(KeyCode::KeyV),
+            34 => rig.frame_meadow_overview(),
             _ => {}
         }
         smoke.fired = true;
@@ -453,13 +464,30 @@ pub fn verify(
                 assert_eq!(rig.mode, ViewMode::Overview);
             }
         }
+        32..=35 => {
+            let fields = crate::grassfield::Fields::new(world.seed, ChunkKey::at(p).origin());
+            if smoke.stage == 35 {
+                assert_eq!(fields.strength(p), 0.);
+            } else {
+                assert!(fields.strength(p) > 0.9);
+                assert!(stream.tall_grass_count(ChunkKey::at(p)) > 300);
+                assert_eq!(
+                    rig.mode,
+                    [
+                        ViewMode::ThirdPerson,
+                        ViewMode::FirstPerson,
+                        ViewMode::Overview
+                    ][smoke.stage - 32]
+                );
+            }
+        }
         _ => {
-            if smoke.saved < 32 {
+            if smoke.saved < 36 {
                 return;
             }
             std::fs::create_dir_all("reports").expect("Cannot create smoke reports");
             let mode = format!(
-                "{}{}{}",
+                "{}{}{}{}{}",
                 if config.enabled { "lod" } else { "full" },
                 if terrain_config.enabled {
                     ""
@@ -470,12 +498,22 @@ pub fn verify(
                     "-distance"
                 } else {
                     ""
+                },
+                if std::env::args().any(|a| a == "--no-vegetation-wind") {
+                    "-wind-off"
+                } else {
+                    ""
+                },
+                if stream.grass_look() == "Legacy" {
+                    "-grass-legacy"
+                } else {
+                    ""
                 }
             );
             std::fs::write(format!("reports/stream-smoke-seed-{}-{mode}.csv", world.seed),
-                format!("view,settled_frames,mean_frame_ms,max_frame_ms,resident_cpu_mib,vegetation_triangles,full_vegetation_triangles,tree_near,tree_middle,tree_far,grass_near,grass_middle,grass_far,lod_rebuilds,last_lod_worker_ms,last_lod_install_ms,terrain_near,terrain_middle,terrain_far,terrain_triangles,full_terrain_triangles,terrain_rebuilds,last_terrain_worker_ms,scheduler,queued,predicted_x,predicted_z,ground_wait_ms,max_ground_wait_ms,ground_wait_events,near_wait_ms,last_near_wait_ms,max_near_wait_ms,transition_frames,max_transition_frame_ms\n{}\n", smoke.report_rows.join("\n"))).expect("Cannot save smoke metrics");
+                format!("view,settled_frames,mean_frame_ms,max_frame_ms,resident_cpu_mib,vegetation_triangles,full_vegetation_triangles,tree_near,tree_middle,tree_far,grass_near,grass_middle,grass_far,lod_rebuilds,last_lod_worker_ms,last_lod_install_ms,terrain_near,terrain_middle,terrain_far,terrain_triangles,full_terrain_triangles,terrain_rebuilds,last_terrain_worker_ms,scheduler,queued,predicted_x,predicted_z,ground_wait_ms,max_ground_wait_ms,ground_wait_events,near_wait_ms,last_near_wait_ms,max_near_wait_ms,transition_frames,max_transition_frame_ms,grass_look,grass_shadow_chunks,grass_mesh_chunks,grass_shadow_candidate_triangles\n{}\n", smoke.report_rows.join("\n"))).expect("Cannot save smoke metrics");
             println!(
-                "STREAM SMOKE PASS: seam crossing, +/- distant coordinates, bounded 49 chunks / 2 tasks, asset eviction, deterministic revisit, cameras, map layers, shared rivers, bank view and mountain headwaters and calm lake, isolated landmark trees, vegetation LOD and FPS/follow switching, regional river connection, lake inlet, curved confluence, dry sand walking, water stop and walking across a shallow ford; 32 captures"
+                "STREAM SMOKE PASS: seam crossing, +/- distant coordinates, bounded 49 chunks / 2 tasks, asset eviction, deterministic revisit, cameras, map layers, shared rivers, bank view and mountain headwaters and calm lake, isolated landmark trees, vegetation LOD and FPS/follow switching, regional river connection, lake inlet, curved confluence, dry sand walking, water stop and walking across a shallow ford, tall grass meadow and calm open ground; 36 captures"
             );
             exit.write(AppExit::Success);
             return;
@@ -514,6 +552,10 @@ pub fn verify(
         "ford-wading",
         "ford-crossed",
         "ford-overview",
+        "grass-meadow",
+        "grass-meadow-first-person",
+        "grass-meadow-overview",
+        "grass-open-ground",
     ][smoke.stage];
     let (actual, full) = stream.vegetation_vertices();
     let (t, g) = stream.lod_counts();
@@ -566,6 +608,11 @@ pub fn verify(
             .copied()
             .fold(0., f64::max)
     ));
+    let (casters, meshes, triangles) = stream.grass_shadow_stats();
+    row.push_str(&format!(
+        ",{},{casters},{meshes},{triangles}",
+        stream.grass_look()
+    ));
     smoke.report_rows.push(row);
     smoke.frames_ms.clear();
     smoke.transition_frames_ms.clear();
@@ -601,6 +648,55 @@ fn sand_bank_view(world: &Meadow) -> (Vec2, f32) {
         }
     }
     panic!("No dry sandy lake bank for native walk test");
+}
+
+fn grass_field_view(world: &Meadow, tall: bool) -> (Vec2, f32) {
+    let g = world.stream_generator().unwrap();
+    let mut candidates = Vec::new();
+    for z in -32..=32 {
+        for x in -32..=32 {
+            let p = Vec2::new(x as f32, z as f32) * 4.;
+            let fields = crate::grassfield::Fields::new(world.seed, ChunkKey::at(p).origin());
+            let strength = fields.strength(p);
+            if (tall && strength > 0.9) || (!tall && strength == 0. && p.length() > 20.) {
+                candidates.push(p);
+            }
+        }
+    }
+    candidates.sort_by(|a, b| a.length_squared().total_cmp(&b.length_squared()));
+    for p in candidates {
+        g.hydrology.prepare(&g, crate::watershed::key(p));
+        let sample = g.habitat(p);
+        if sample.grass_density < 0.42 || sample.slope > 0.25 || g.hydrology.ford_route(p) {
+            continue;
+        }
+        let trees = g.tree_neighbours(ChunkKey::at(p));
+        let fields = crate::grassfield::Fields::new(world.seed, ChunkKey::at(p).origin());
+        let mut directions: Vec<_> = (0..16)
+            .map(|n| Vec2::from_angle(n as f32 * std::f32::consts::TAU / 16.))
+            .collect();
+        directions.sort_by(|a, b| {
+            let score = |direction: Vec2| {
+                let q = p + direction * 12.;
+                let strength = fields.strength(q);
+                if tall {
+                    strength * g.habitat(q).grass_density
+                } else {
+                    1. - strength
+                }
+            };
+            score(*b).total_cmp(&score(*a))
+        });
+        for forward in directions {
+            if (0..=36).all(|step| {
+                let q = p + forward * (step as f32 * 0.5 - 6.);
+                world.walkable(q) && trees.iter().all(|(tree, _)| tree.distance(q) > 4.)
+            }) {
+                return (p, (-forward.x).atan2(-forward.y));
+            }
+        }
+    }
+    panic!("No suitable grass field view for seed {}", world.seed);
 }
 
 fn confluence_view(world: &Meadow) -> (Vec2, f32) {

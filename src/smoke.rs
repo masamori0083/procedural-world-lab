@@ -24,7 +24,7 @@ type CameraEntities = (
 type EnvironmentChecks<'w, 's> = (
     Res<'w, MapLayer>,
     Res<'w, Assets<Mesh>>,
-    Single<'w, 's, &'static Visibility, With<Grass>>,
+    Query<'w, 's, &'static Visibility, With<Grass>>,
 );
 
 #[derive(Resource)]
@@ -62,6 +62,7 @@ pub fn drive(
     mut keys: ResMut<ButtonInput<KeyCode>>,
     mut rig: ResMut<CameraRig>,
     mut window: Single<&mut Window, With<PrimaryWindow>>,
+    mut mouse: ResMut<bevy::input::mouse::AccumulatedMouseMotion>,
 ) {
     let Some(mut smoke) = smoke else {
         return;
@@ -73,6 +74,9 @@ pub fn drive(
     window.focused = true;
     rig.captured = smoke.stage != 7;
     keys.reset_all();
+    // Scripted checks own the controls; cursor locking and live pointer motion
+    // must not alter the turn measured below.
+    mouse.delta = Vec2::ZERO;
     smoke.elapsed += time.delta_secs().min(0.1);
     match smoke.stage {
         1 => {
@@ -292,13 +296,16 @@ pub fn verify(
                 MapLayer::Natural,
             ][smoke.stage - 13];
             assert_eq!(*layer, expected);
-            assert_eq!(
-                **grass,
-                if expected == MapLayer::Natural {
-                    Visibility::Inherited
-                } else {
-                    Visibility::Hidden
-                }
+            assert_eq!(grass.iter().count(), 2, "visual grass and shadow proxy");
+            let expected_visibility = if expected == MapLayer::Natural {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
+            };
+            assert!(
+                grass
+                    .iter()
+                    .all(|visibility| *visibility == expected_visibility)
             );
             assert_eq!(
                 materials.get(&terrain_mesh.1.0).unwrap().unlit,

@@ -139,6 +139,11 @@ impl Meadow {
     pub fn stream_generator(&self) -> Option<crate::streaming::Generator> {
         self.streaming.clone()
     }
+    pub fn set_grass_look(&mut self, refined: bool) {
+        if let Some(generator) = &mut self.streaming {
+            generator.refined_grass = refined;
+        }
+    }
     pub fn is_streaming(&self) -> bool {
         self.streaming.is_some()
     }

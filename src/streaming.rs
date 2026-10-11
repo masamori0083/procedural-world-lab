@@ -10,6 +10,7 @@ use crate::{
 };
 use bevy::{
     asset::RenderAssetUsages,
+    camera::visibility::VisibilityRange,
     mesh::{Indices, VertexAttributeValues},
     prelude::*,
     render::render_resource::PrimitiveTopology,
@@ -21,7 +22,7 @@ use std::{
     time::Instant,
 };
 
-pub const VERSION: u32 = 14;
+pub const VERSION: u32 = 19;
 pub const CHUNK_SIZE: f32 = 96.0;
 pub const RADIUS: i32 = 3;
 pub const MAX_CHUNKS: usize = ((RADIUS * 2 + 1) * (RADIUS * 2 + 1)) as usize;
@@ -145,7 +146,7 @@ fn mix(mut n: u32) -> u32 {
     n = n.wrapping_mul(0x846c_a68b);
     n ^ (n >> 16)
 }
-fn coordinate_seed(seed: u32, x: i32, z: i32) -> u32 {
+pub(crate) fn coordinate_seed(seed: u32, x: i32, z: i32) -> u32 {
     mix(seed ^ (x as u32).wrapping_mul(0x9e37_79b9) ^ (z as u32).wrapping_mul(0x85eb_ca6b))
 }
 fn smooth(t: f32) -> f32 {
@@ -158,6 +159,7 @@ pub struct Generator {
     pub seed: u32,
     pub settings: TerrainSettings,
     pub hydrology: Arc<crate::watershed::Cache>,
+    pub refined_grass: bool,
 }
 impl Generator {
     pub fn new(seed: u32, settings: TerrainSettings) -> Self {
@@ -165,10 +167,15 @@ impl Generator {
             seed,
             settings,
             hydrology: Arc::default(),
+            refined_grass: true,
         };
         // One coarse spawn-region plan; distant plans run in chunk workers.
         g.hydrology.prepare(&g, crate::watershed::key(Vec2::ZERO));
         g
+    }
+    pub fn with_grass_look(mut self, refined: bool) -> Self {
+        self.refined_grass = refined;
+        self
     }
     pub fn water(&self, p: Vec2) -> crate::river::RiverField {
         self.hydrology.field(p)
@@ -422,6 +429,8 @@ pub(crate) struct Batch {
     pub(crate) positions: Vec<[f32; 3]>,
     normals: Vec<[f32; 3]>,
     colors: Vec<[f32; 4]>,
+    wind: Vec<[f32; 2]>,
+    uvs: Vec<[f32; 2]>,
 }
 impl Batch {
     pub(crate) fn append(&mut self, mesh: Mesh, offset: Vec3) {
@@ -441,6 +450,11 @@ impl Batch {
             .extend(p.iter().map(|p| (Vec3::from(*p) + offset).to_array()));
         self.normals.extend(n);
         self.colors.extend(c);
+        if let Some(VertexAttributeValues::Float32x2(uvs)) = mesh.attribute(Mesh::ATTRIBUTE_UV_0) {
+            self.uvs.extend(uvs);
+        } else {
+            self.uvs.extend(std::iter::repeat_n([0.; 2], p.len()));
+        }
     }
     pub(crate) fn triangle(&mut self, a: Vec3, b: Vec3, c: Vec3, color: [f32; 4]) {
         self.positions
@@ -448,15 +462,59 @@ impl Batch {
         self.normals
             .extend([(b - a).cross(c - a).normalize().to_array(); 3]);
         self.colors.extend([color; 3]);
+        self.uvs.extend([[0.; 2]; 3]);
+    }
+    pub(crate) fn append_wind(
+        &mut self,
+        mesh: Mesh,
+        offset: Vec3,
+        root: f32,
+        height: f32,
+        phase: f32,
+        amplitude: f32,
+    ) {
+        let first = self.positions.len();
+        self.append(mesh, offset);
+        self.wind.extend(self.positions[first..].iter().map(|p| {
+            let height = ((p[1] - root) / height.max(0.1)).clamp(0., 1.);
+            [amplitude * height * height, phase]
+        }));
+    }
+    pub(crate) fn plant_triangle(
+        &mut self,
+        points: [Vec3; 3],
+        colors: [[f32; 4]; 3],
+        wind: [[f32; 2]; 3],
+    ) {
+        self.triangle(points[0], points[1], points[2], colors[0]);
+        let first = self.colors.len() - 3;
+        self.colors[first..].copy_from_slice(&colors);
+        self.wind.extend(wind);
+    }
+    pub(crate) fn plant_uvs(&mut self, uvs: [[f32; 2]; 3]) {
+        let start = self.uvs.len() - 3;
+        self.uvs[start..].copy_from_slice(&uvs);
+    }
+    pub(crate) fn plant_normals(&mut self, normals: [Vec3; 3]) {
+        let start = self.normals.len() - 3;
+        for (out, normal) in self.normals[start..].iter_mut().zip(normals) {
+            *out = normal.normalize().to_array();
+        }
     }
     pub(crate) fn mesh(self) -> Mesh {
-        Mesh::new(
+        let mut mesh = Mesh::new(
             PrimitiveTopology::TriangleList,
             RenderAssetUsages::default(),
         )
         .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, self.positions)
         .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, self.normals)
-        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, self.colors)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, self.colors);
+        if !self.wind.is_empty() {
+            assert_eq!(self.wind.len(), mesh.count_vertices());
+            mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, self.uvs);
+            mesh.insert_attribute(Mesh::ATTRIBUTE_UV_1, self.wind);
+        }
+        mesh
     }
 }
 #[cfg(test)]
@@ -472,6 +530,7 @@ fn generate_at(
 ) -> ChunkData {
     let start = Instant::now();
     let origin = key.origin();
+    let fields = crate::grassfield::Fields::new(generator.seed, origin);
     generator.hydrology.prepare(
         &generator,
         crate::watershed::key(origin + Vec2::splat(CHUNK_SIZE * 0.5)),
@@ -489,8 +548,11 @@ fn generate_at(
             let dx = generator.height(p + Vec2::X * CELL) - generator.height(p - Vec2::X * CELL);
             let dz = generator.height(p + Vec2::Y * CELL) - generator.height(p - Vec2::Y * CELL);
             normals.push(Vec3::new(-dx, 2. * CELL, -dz).normalize().to_array());
-            samples.push(generator.habitat(p));
-            patches.push(generator.noise(p * 0.08));
+            let sample = generator.habitat(p);
+            patches.push(crate::grassfield::ground_tint(
+                &generator, &fields, p, sample,
+            ));
+            samples.push(sample);
         }
     }
     let (water, lake) = water_meshes(&generator, origin, &positions);
@@ -522,34 +584,7 @@ fn generate_at(
         let offset = Vec3::new(q.x, generator.ground(*p), q.y);
         placed.push(vegetation::PlacedTree::new(tree, offset));
     }
-    let mut blades = Vec::new();
-    let mut random = SeedRandom(coordinate_seed(generator.seed ^ 0x581c_aa42, key.0, key.1));
-    for _ in 0..480 {
-        let q = Vec2::new(random.range(0., CHUNK_SIZE), random.range(0., CHUNK_SIZE));
-        let p = origin + q;
-        let sample = generator.habitat(p);
-        if random.unit() > sample.grass_density
-            || sample.slope > 0.75
-            || generator.water_depth(p) >= -0.015
-        {
-            continue;
-        }
-        let height = generator.ground(p);
-        let direction = Vec2::from_angle(random.range(0., std::f32::consts::TAU)) * 0.09;
-        let a = Vec3::new(q.x - direction.x, height, q.y - direction.y);
-        let b = Vec3::new(q.x + direction.x, height, q.y + direction.y);
-        let c = Vec3::new(q.x, height + random.range(0.18, 0.38), q.y);
-        blades.push(vegetation::Blade {
-            a,
-            b,
-            c,
-            color: {
-                let c =
-                    Vec3::new(0.30, 0.33, 0.09).lerp(Vec3::new(0.14, 0.35, 0.07), sample.moisture);
-                [c.x, c.y, c.z, 1.]
-            },
-        });
-    }
+    let blades = crate::grassfield::generate(&generator, key, &fields, &positions, &samples);
     // Small riparian bushes share the grass batch/LOD; no extra draw calls or collision.
     let mut shrubs = Vec::new();
     let mut random = SeedRandom(coordinate_seed(generator.seed ^ 0x21b5_724d, key.0, key.1));
@@ -577,8 +612,9 @@ fn generate_at(
         grass: blades,
         shrubs,
         origin: Vec3::new(origin.x, 0., origin.y),
+        refined_grass: generator.refined_grass,
     });
-    let built = vegetation.build(vegetation.levels(view, None));
+    let built = vegetation.build_streamed(vegetation.stream_request(view, None), None);
     let stones = ford_stone_mesh(&ford_stones(&generator, key), origin);
     let ground = simplify_surface(
         &generator,
@@ -591,8 +627,12 @@ fn generate_at(
         patches,
     );
     let bytes = ground.bytes
-        + built.vertices * 40
+        + built.vertices * vegetation::VERTEX_BYTES
         + vegetation.bytes()
+        + built
+            .request
+            .as_ref()
+            .map_or(0, vegetation::StreamRequest::bytes)
         + water_vertices * 48
         + stones.count_vertices() * 40;
     ChunkData {
@@ -704,6 +744,7 @@ fn rebuild_surface(
     trees: &[(Vec2, f32)],
 ) -> SurfaceBuilt {
     let start = Instant::now();
+    let fields = crate::grassfield::Fields::new(g.seed, key.origin());
     for region in tree_regions(key) {
         g.hydrology.prepare(g, region);
     }
@@ -718,8 +759,9 @@ fn rebuild_surface(
             let dx = g.height(p + Vec2::X * CELL) - g.height(p - Vec2::X * CELL);
             let dz = g.height(p + Vec2::Y * CELL) - g.height(p - Vec2::Y * CELL);
             normals.push(Vec3::new(-dx, 2. * CELL, -dz).normalize().to_array());
-            samples.push(g.habitat(p));
-            patches.push(g.noise(p * 0.08));
+            let sample = g.habitat(p);
+            patches.push(crate::grassfield::ground_tint(g, &fields, p, sample));
+            samples.push(sample);
         }
     }
     let mut built = simplify_surface(g, key, detail, trees, positions, normals, samples, patches);
@@ -937,9 +979,18 @@ struct Resident {
     surface_bytes: usize,
     surface_triangles: usize,
     tree_entity: Entity,
+    leaf_entity: Entity,
     grass_entity: Entity,
+    grass_shadow_entity: Entity,
+    grass_shadows: bool,
+    grass_triangles: usize,
     vegetation: Arc<Blueprint>,
     levels: Levels,
+    request: vegetation::StreamRequest,
+    tree_lods: Vec<TreeResident>,
+    grass_lods: Vec<TreeResident>,
+    part_meshes: Vec<AssetId<Mesh>>,
+    part_vertices: usize,
     vegetation_meshes: Vec<AssetId<Mesh>>,
     vegetation_vertices: usize,
     meshes: Vec<AssetId<Mesh>>,
@@ -947,6 +998,233 @@ struct Resident {
     obstacles: Vec<TreeObstacle>,
     bytes: usize,
     water_vertices: usize,
+}
+
+#[derive(Default)]
+struct TreeResident {
+    pairs: [Option<TreePair>; 3],
+}
+struct TreePair {
+    entities: Vec<Entity>,
+    meshes: Vec<AssetId<Mesh>>,
+    vertices: usize,
+}
+/// Add only newly requested tree levels and release expired levels. Existing
+/// levels keep their handles, materials and common crown transform.
+#[allow(clippy::too_many_arguments)]
+fn install_tree_lods(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    root: Entity,
+    blueprint: &Blueprint,
+    plan: &vegetation::TreePlan,
+    resident: &mut Vec<TreeResident>,
+    additions: Vec<vegetation::TreeLodMesh>,
+    wood: &Handle<crate::wind::VegetationMaterial>,
+    leaves: &Handle<crate::wind::VegetationMaterial>,
+) -> (Vec<AssetId<Mesh>>, Vec<AssetId<Mesh>>) {
+    resident.resize_with(blueprint.trees.len(), TreeResident::default);
+    let mut removed = Vec::new();
+    let mut added = Vec::new();
+    for (index, tree) in resident.iter_mut().enumerate() {
+        for level in 0..3 {
+            if plan.masks[index] & (1 << level) == 0
+                && let Some(pair) = tree.pairs[level].take()
+            {
+                for entity in pair.entities {
+                    commands.entity(entity).despawn();
+                }
+                for id in pair.meshes {
+                    meshes.remove(id);
+                    removed.push(id);
+                }
+            }
+        }
+    }
+    for data in additions {
+        let mut pair = TreePair {
+            entities: vec![],
+            meshes: vec![],
+            vertices: 0,
+        };
+        for (mesh, material) in [(data.wood, wood), (data.leaves, leaves)] {
+            if mesh.count_vertices() == 0 {
+                continue;
+            }
+            let bounds = crate::wind::bounds(&mesh);
+            pair.vertices += mesh.count_vertices();
+            let mesh = meshes.add(mesh);
+            pair.meshes.push(mesh.id());
+            added.push(mesh.id());
+            let entity = commands
+                .spawn((
+                    Name::new(format!("Tree {} {:?}", data.index, data.detail)),
+                    Transform::from_translation(data.center),
+                    Visibility::Inherited,
+                    bounds,
+                    Mesh3d(mesh),
+                    MeshMaterial3d(material.clone()),
+                    ChildOf(root),
+                ))
+                .id();
+            pair.entities.push(entity);
+        }
+        assert!(resident[data.index].pairs[data.detail.index()].is_none());
+        resident[data.index].pairs[data.detail.index()] = Some(pair);
+    }
+    for (index, tree) in resident.iter().enumerate() {
+        for detail in [
+            vegetation::Detail::Near,
+            vegetation::Detail::Middle,
+            vegetation::Detail::Far,
+        ] {
+            if let Some(pair) = &tree.pairs[detail.index()] {
+                let range =
+                    vegetation::tree_range(blueprint.trees[index].diameter, plan, index, detail);
+                for entity in &pair.entities {
+                    if let Some(range) = &range {
+                        commands.entity(*entity).insert(range.clone());
+                    } else {
+                        commands.entity(*entity).remove::<VisibilityRange>();
+                    }
+                }
+            }
+        }
+    }
+    (removed, added)
+}
+fn tree_vertices(resident: &[TreeResident]) -> usize {
+    resident
+        .iter()
+        .flat_map(|t| t.pairs.iter().flatten())
+        .map(|p| p.vertices)
+        .sum()
+}
+fn tree_mesh_ids(resident: &[TreeResident]) -> impl Iterator<Item = AssetId<Mesh>> + '_ {
+    resident
+        .iter()
+        .flat_map(|t| t.pairs.iter().flatten())
+        .flat_map(|p| p.meshes.iter().copied())
+}
+// Reuse the same bounded cache ownership as trees, with a visual and optional
+// shadow mesh in each pair. Patch geometry keeps the original world roots.
+#[allow(clippy::too_many_arguments)]
+fn install_grass_lods(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    root: Entity,
+    plan: &vegetation::GrassPlan,
+    resident: &mut Vec<TreeResident>,
+    additions: Vec<vegetation::GrassLodMesh>,
+    visual_material: &Handle<crate::wind::VegetationMaterial>,
+    shadow_material: &Handle<crate::wind::VegetationMaterial>,
+    visible: bool,
+    shadows: bool,
+) -> (Vec<AssetId<Mesh>>, Vec<AssetId<Mesh>>) {
+    resident.resize_with(vegetation::GRASS_PATCH_COUNT, TreeResident::default);
+    let mut removed = Vec::new();
+    let mut added = Vec::new();
+    for (i, patch) in resident.iter_mut().enumerate() {
+        for level in 0..2 {
+            if plan.masks[i] & (1 << level) == 0
+                && let Some(pair) = patch.pairs[level].take()
+            {
+                for entity in pair.entities {
+                    commands.entity(entity).despawn();
+                }
+                for id in pair.meshes {
+                    meshes.remove(id);
+                    removed.push(id);
+                }
+            }
+        }
+    }
+    for data in additions {
+        let mut pair = TreePair {
+            entities: vec![],
+            meshes: vec![],
+            vertices: 0,
+        };
+        for (shadow, mesh, material) in [
+            (false, data.visual, visual_material),
+            (true, data.shadow, shadow_material),
+        ] {
+            if mesh.count_vertices() == 0 {
+                continue;
+            }
+            let bounds = crate::wind::bounds(&mesh);
+            pair.vertices += mesh.count_vertices();
+            let mesh = meshes.add(mesh);
+            added.push(mesh.id());
+            pair.meshes.push(mesh.id());
+            let mut entity = commands.spawn((
+                Name::new(format!(
+                    "Grass patch {} {:?} {}",
+                    data.index, data.detail, shadow
+                )),
+                Grass,
+                Transform::from_translation(data.center),
+                bounds,
+                Mesh3d(mesh),
+                MeshMaterial3d(material.clone()),
+                ChildOf(root),
+                if visible {
+                    Visibility::Inherited
+                } else {
+                    Visibility::Hidden
+                },
+            ));
+            if shadow {
+                entity.insert(bevy::camera::visibility::RenderLayers::layer(1));
+                if !shadows {
+                    entity.insert(bevy::light::NotShadowCaster);
+                }
+            } else {
+                entity.insert((
+                    bevy::light::NotShadowCaster,
+                    bevy::light::TransmittedShadowReceiver,
+                ));
+            }
+            pair.entities.push(entity.id());
+        }
+        assert!(resident[data.index].pairs[data.detail.index()].is_none());
+        resident[data.index].pairs[data.detail.index()] = Some(pair);
+    }
+    for (i, patch) in resident.iter().enumerate() {
+        for detail in [vegetation::Detail::Near, vegetation::Detail::Middle] {
+            if let Some(pair) = &patch.pairs[detail.index()] {
+                for entity in &pair.entities {
+                    if let Some(range) = vegetation::grass_range(plan, i, detail) {
+                        commands.entity(*entity).insert(range);
+                    } else {
+                        commands.entity(*entity).remove::<VisibilityRange>();
+                    }
+                }
+            }
+        }
+    }
+    (removed, added)
+}
+impl Resident {
+    fn grass_detail(&self) -> vegetation::Detail {
+        if self.request.grass.is_some() {
+            if self.grass_lods.iter().any(|p| p.pairs[0].is_some()) {
+                vegetation::Detail::Near
+            } else {
+                vegetation::Detail::Middle
+            }
+        } else {
+            self.levels.grass
+        }
+    }
+    fn grass_shadow_entities(&self) -> impl Iterator<Item = Entity> + '_ {
+        std::iter::once(self.grass_shadow_entity).chain(
+            self.grass_lods
+                .iter()
+                .filter_map(|p| p.pairs[0].as_ref())
+                .filter_map(|p| p.entities.get(1).copied()),
+        )
+    }
 }
 #[derive(Resource)]
 pub struct StreamWorld {
@@ -973,12 +1251,17 @@ pub struct StreamWorld {
     pub terrain_rebuilt: u64,
     pub last_terrain_ms: f64,
     lod_enabled: bool,
+    lod_eye: Vec3,
     pub lod_rebuilt: u64,
+    pub tree_lod_rebuilt: u64,
     pub last_lod_ms: f64,
     pub last_lod_install_ms: f64,
     terrain_material: Handle<StandardMaterial>,
-    trees_material: Handle<StandardMaterial>,
-    grass_material: Handle<StandardMaterial>,
+    trees_material: Handle<crate::wind::VegetationMaterial>,
+    leaves_material: Handle<crate::wind::VegetationMaterial>,
+    grass_material: Handle<crate::wind::VegetationMaterial>,
+    grass_shadow_material: Handle<crate::wind::VegetationMaterial>,
+    stones_material: Handle<StandardMaterial>,
     water_material: Handle<StandardMaterial>,
     lake_material: Handle<StandardMaterial>,
     pub generated: u64,
@@ -987,6 +1270,35 @@ pub struct StreamWorld {
     pub last_install_ms: f64,
 }
 impl StreamWorld {
+    pub fn grass_look(&self) -> &'static str {
+        if self.generator.refined_grass {
+            "Refined"
+        } else {
+            "Legacy"
+        }
+    }
+    /// Potential geometry in grass caster batches, before GPU/cascade culling.
+    pub fn grass_shadow_stats(&self) -> (usize, usize, usize) {
+        let mut stats = (0, 0, 0);
+        for c in self.loaded.values().filter(|c| c.grass_triangles > 0) {
+            stats.1 += 1;
+            if c.grass_shadows {
+                stats.0 += 1;
+                stats.2 += c.grass_triangles;
+            }
+        }
+        stats
+    }
+    pub fn tall_grass_count(&self, key: ChunkKey) -> usize {
+        self.loaded.get(&key).map_or(0, |chunk| {
+            chunk
+                .vegetation
+                .grass
+                .iter()
+                .filter(|b| b.c.y - (b.a.y + b.b.y) * 0.5 > 0.75)
+                .count()
+        })
+    }
     pub fn scheduler_name(&self) -> &'static str {
         if self.priority_enabled {
             "PRIORITY"
@@ -1044,7 +1356,10 @@ impl StreamWorld {
                 }
             }),
             Work::Vegetation(_) => self.loaded.get(&key).map_or(9, |chunk| {
-                let desired = chunk.vegetation.levels(view, Some(chunk.levels));
+                let desired = chunk
+                    .vegetation
+                    .stream_request(view, Some(&chunk.request))
+                    .levels;
                 desired.trees.index() * 3 + desired.grass.index()
             }),
         };
@@ -1131,14 +1446,72 @@ impl StreamWorld {
             self.loaded.len() * (SIDE - 1) * (SIDE - 1) * 2,
         )
     }
+    /// Candidate tree draws before frustum/cascade culling. Adjacent levels
+    /// both count in a fade band; cached but inactive levels do not count.
+    pub fn tree_stats(&self, eye: Vec3) -> ([usize; 3], usize, usize) {
+        let mut counts = [0; 3];
+        let mut vertices = 0;
+        let mut entities = 0;
+        for chunk in self.loaded.values() {
+            for (index, tree) in chunk.tree_lods.iter().enumerate() {
+                let placed = &chunk.vegetation.trees[index];
+                let distance = (placed.center + chunk.vegetation.origin).distance(eye);
+                for detail in [
+                    vegetation::Detail::Near,
+                    vegetation::Detail::Middle,
+                    vegetation::Detail::Far,
+                ] {
+                    if let Some(pair) = &tree.pairs[detail.index()] {
+                        entities += pair.entities.len();
+                        let active = vegetation::tree_range(
+                            placed.diameter,
+                            &chunk.request.trees,
+                            index,
+                            detail,
+                        )
+                        .is_none_or(|r| {
+                            distance >= r.start_margin.start && distance <= r.end_margin.end
+                        });
+                        if active {
+                            counts[detail.index()] += 1;
+                            vertices += pair.vertices;
+                        }
+                    }
+                }
+            }
+        }
+        (counts, vertices, entities)
+    }
     pub fn lod_counts(&self) -> ([usize; 3], [usize; 3]) {
-        let mut trees = [0; 3];
         let mut grass = [0; 3];
         for chunk in self.loaded.values() {
-            trees[chunk.levels.trees.index()] += 1;
-            grass[chunk.levels.grass.index()] += 1;
+            if let Some(plan) = &chunk.request.grass {
+                for (i, occupied) in plan.occupied.iter().enumerate() {
+                    if !occupied {
+                        continue;
+                    }
+                    let distance =
+                        (plan.centers[i] + chunk.vegetation.origin).distance(self.lod_eye);
+                    let mut active = false;
+                    for detail in [vegetation::Detail::Near, vegetation::Detail::Middle] {
+                        if chunk.grass_lods[i].pairs[detail.index()].is_some()
+                            && vegetation::grass_range(plan, i, detail).is_none_or(|r| {
+                                distance >= r.start_margin.start && distance <= r.end_margin.end
+                            })
+                        {
+                            grass[detail.index()] += 1;
+                            active = true;
+                        }
+                    }
+                    if !active {
+                        grass[2] += 1;
+                    }
+                }
+            } else {
+                grass[chunk.levels.grass.index()] += 1;
+            }
         }
-        (trees, grass)
+        (self.tree_stats(self.lod_eye).0, grass)
     }
     pub fn vegetation_vertices(&self) -> (usize, usize) {
         (
@@ -1193,15 +1566,19 @@ pub fn setup(
     terrain_config: Res<terrain_lod::Config>,
     priority_config: Res<PriorityConfig>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut plants: ResMut<Assets<crate::wind::VegetationMaterial>>,
     river: Option<Res<crate::water::RiverMaterial>>,
+    shared_plants: Res<crate::wind::Materials>,
 ) {
     let Some(generator) = world.stream_generator() else {
         return;
     };
+    let refined = generator.refined_grass;
     commands.insert_resource(StreamWorld {
         generator,
         settings: *settings,
         center: ChunkKey::at(Vec2::ZERO),
+        lod_eye: Vec3::ZERO,
         loaded: BTreeMap::new(),
         pending: BTreeMap::new(),
         pending_lod: BTreeMap::new(),
@@ -1223,21 +1600,33 @@ pub fn setup(
         last_terrain_ms: 0.,
         lod_enabled: config.enabled,
         lod_rebuilt: 0,
+        tree_lod_rebuilt: 0,
         last_lod_ms: 0.,
         last_lod_install_ms: 0.,
         terrain_material: materials.add(StandardMaterial {
             perceptual_roughness: 1.,
             ..default()
         }),
-        trees_material: materials.add(StandardMaterial {
+        stones_material: materials.add(StandardMaterial {
             perceptual_roughness: 1.,
             ..default()
         }),
-        grass_material: materials.add(StandardMaterial {
-            perceptual_roughness: 1.,
-            cull_mode: None,
-            ..default()
-        }),
+        trees_material: shared_plants.wood.clone(),
+        leaves_material: shared_plants.leaves.clone(),
+        grass_shadow_material: shared_plants.shadow_grass.clone(),
+        grass_material: if refined {
+            shared_plants.grass.clone()
+        } else {
+            plants.add(crate::wind::VegetationMaterial {
+                base: StandardMaterial {
+                    cull_mode: None,
+                    double_sided: true,
+                    perceptual_roughness: 1.,
+                    ..default()
+                },
+                ..default()
+            })
+        },
         lake_material: materials.add(StandardMaterial {
             base_color: Color::srgb(0.22, 0.48, 0.57),
             perceptual_roughness: 0.32,
@@ -1332,15 +1721,37 @@ pub fn update(
                     .insert_attribute(Mesh::ATTRIBUTE_COLOR, data.colors.colors(*layer));
                 let surface = meshes.add(data.surface);
                 let surface_triangles = meshes.get(&surface).unwrap().indices().unwrap().len() / 3;
+                let tree_bounds = crate::wind::bounds(&data.built.trees);
+                let leaf_bounds = crate::wind::bounds(&data.built.leaves);
+                let grass_bounds = crate::wind::bounds(&data.built.grass);
+                let shadow_bounds = crate::wind::bounds(&data.built.shadow_grass);
+                let grass_triangles = if data.vegetation.refined_grass {
+                    data.built.shadow_grass.count_vertices() / 3
+                } else {
+                    data.built.grass.count_vertices() / 3
+                };
+                let part_vertices = data.built.trees.count_vertices()
+                    + data.built.leaves.count_vertices()
+                    + data.built.grass.count_vertices()
+                    + data.built.shadow_grass.count_vertices();
                 let trees =
                     (data.built.trees.count_vertices() > 0).then(|| meshes.add(data.built.trees));
+                let leaves =
+                    (data.built.leaves.count_vertices() > 0).then(|| meshes.add(data.built.leaves));
                 let grass =
                     (data.built.grass.count_vertices() > 0).then(|| meshes.add(data.built.grass));
-                let vegetation_meshes: Vec<_> = [trees.as_ref(), grass.as_ref()]
-                    .into_iter()
-                    .flatten()
-                    .map(|m| m.id())
-                    .collect();
+                let shadow_grass = (data.built.shadow_grass.count_vertices() > 0)
+                    .then(|| meshes.add(data.built.shadow_grass));
+                let mut vegetation_meshes: Vec<_> = [
+                    trees.as_ref(),
+                    leaves.as_ref(),
+                    grass.as_ref(),
+                    shadow_grass.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                .map(|m| m.id())
+                .collect();
                 let water = (data.water.count_vertices() > 0).then(|| meshes.add(data.water));
                 let lake = (data.lake.count_vertices() > 0).then(|| meshes.add(data.lake));
                 let stones = (data.stones.count_vertices() > 0).then(|| meshes.add(data.stones));
@@ -1349,7 +1760,9 @@ pub fn update(
                 mesh_ids.extend(
                     [
                         trees.as_ref(),
+                        leaves.as_ref(),
                         grass.as_ref(),
+                        shadow_grass.as_ref(),
                         water.as_ref(),
                         lake.as_ref(),
                         stones.as_ref(),
@@ -1362,6 +1775,8 @@ pub fn update(
                 let mut tree_entity = Entity::PLACEHOLDER;
                 let mut surface_entity = Entity::PLACEHOLDER;
                 let mut grass_entity = Entity::PLACEHOLDER;
+                let mut leaf_entity = Entity::PLACEHOLDER;
+                let mut grass_shadow_entity = Entity::PLACEHOLDER;
                 let root = commands
                     .spawn((
                         Name::new(format!("Chunk {},{}", key.0, key.1)),
@@ -1373,7 +1788,7 @@ pub fn update(
                             root.spawn((
                                 Name::new("Ford bank stones"),
                                 Mesh3d(stones),
-                                MeshMaterial3d(stream.trees_material.clone()),
+                                MeshMaterial3d(stream.stones_material.clone()),
                             ));
                         }
                         surface_entity = root
@@ -1387,12 +1802,23 @@ pub fn update(
                         let mut entity = root.spawn((
                             Transform::default(),
                             Visibility::Inherited,
+                            tree_bounds,
                             MeshMaterial3d(stream.trees_material.clone()),
                         ));
                         if let Some(trees) = trees {
                             entity.insert(Mesh3d(trees));
                         }
                         tree_entity = entity.id();
+                        let mut entity = root.spawn((
+                            Transform::default(),
+                            Visibility::Inherited,
+                            leaf_bounds,
+                            MeshMaterial3d(stream.leaves_material.clone()),
+                        ));
+                        if let Some(leaves) = leaves {
+                            entity.insert(Mesh3d(leaves));
+                        }
+                        leaf_entity = entity.id();
                         if let Some(water) = water {
                             root.spawn((
                                 Mesh3d(water),
@@ -1409,7 +1835,9 @@ pub fn update(
                         }
                         let mut entity = root.spawn((
                             Grass,
+                            bevy::light::NotShadowCaster,
                             Transform::default(),
+                            grass_bounds,
                             MeshMaterial3d(stream.grass_material.clone()),
                             if *layer == MapLayer::Natural {
                                 Visibility::Inherited
@@ -1420,9 +1848,69 @@ pub fn update(
                         if let Some(grass) = grass {
                             entity.insert(Mesh3d(grass));
                         }
+                        if stream.generator.refined_grass {
+                            entity.insert(bevy::light::TransmittedShadowReceiver);
+                        }
                         grass_entity = entity.id();
+                        if data.vegetation.refined_grass {
+                            let mut entity = root.spawn((
+                                Grass,
+                                Transform::default(),
+                                Visibility::Inherited,
+                                shadow_bounds,
+                                bevy::light::NotShadowCaster,
+                                bevy::camera::visibility::RenderLayers::layer(1),
+                                MeshMaterial3d(stream.grass_shadow_material.clone()),
+                            ));
+                            if let Some(mesh) = shadow_grass {
+                                entity.insert(Mesh3d(mesh));
+                            }
+                            grass_shadow_entity = entity.id();
+                        } else {
+                            grass_shadow_entity = grass_entity;
+                        }
                     })
                     .id();
+                let part_meshes = vegetation_meshes.clone();
+                let request = data.built.request.take().unwrap();
+                let mut tree_lods = Vec::new();
+                let (_, added) = install_tree_lods(
+                    &mut commands,
+                    &mut meshes,
+                    root,
+                    &data.vegetation,
+                    &request.trees,
+                    &mut tree_lods,
+                    std::mem::take(&mut data.built.tree_additions),
+                    &stream.trees_material,
+                    &stream.leaves_material,
+                );
+                let mut grass_lods = Vec::new();
+                let mut grass_triangles = grass_triangles;
+                let mut added = added;
+                if let Some(plan) = &request.grass {
+                    grass_triangles += data
+                        .built
+                        .grass_additions
+                        .iter()
+                        .map(|p| p.shadow.count_vertices() / 3)
+                        .sum::<usize>();
+                    let (_, ids) = install_grass_lods(
+                        &mut commands,
+                        &mut meshes,
+                        root,
+                        plan,
+                        &mut grass_lods,
+                        std::mem::take(&mut data.built.grass_additions),
+                        &stream.grass_material,
+                        &stream.grass_shadow_material,
+                        *layer == MapLayer::Natural,
+                        false,
+                    );
+                    added.extend(ids);
+                }
+                mesh_ids.extend(added.iter().copied());
+                vegetation_meshes.extend(added);
                 stream.loaded.insert(
                     key,
                     Resident {
@@ -1433,9 +1921,18 @@ pub fn update(
                         surface_bytes: data.surface_bytes,
                         surface_triangles,
                         tree_entity,
+                        leaf_entity,
                         grass_entity,
+                        grass_shadow_entity,
+                        grass_shadows: false,
+                        grass_triangles,
                         vegetation: data.vegetation,
                         levels: data.built.levels,
+                        request,
+                        tree_lods,
+                        grass_lods,
+                        part_meshes,
+                        part_vertices,
                         vegetation_meshes,
                         vegetation_vertices: data.built.vertices,
                         meshes: mesh_ids,
@@ -1489,53 +1986,149 @@ pub fn update(
                 stream.last_terrain_ms = built.elapsed_ms;
             }
             Work::Vegetation(_) => {
-                let Some(built) = block_on(poll_once(stream.pending_lod.get_mut(&key).unwrap()))
+                let Some(mut built) =
+                    block_on(poll_once(stream.pending_lod.get_mut(&key).unwrap()))
                 else {
                     continue;
                 };
                 stream.pending_lod.remove(&key);
+                let tree_material = stream.trees_material.clone();
+                let leaf_material = stream.leaves_material.clone();
+                let grass_material = stream.grass_material.clone();
+                let grass_shadow_material = stream.grass_shadow_material.clone();
                 let Some(chunk) = stream.loaded.get_mut(&key) else {
                     continue;
                 };
-                if chunk.vegetation.levels(view, Some(chunk.levels)) != built.levels {
+                let desired = chunk.vegetation.stream_request(view, Some(&chunk.request));
+                if !built.matches_cache(&chunk.request, &desired) {
                     continue;
                 }
                 let start = Instant::now();
-                let trees = (built.trees.count_vertices() > 0).then(|| meshes.add(built.trees));
-                let grass = (built.grass.count_vertices() > 0).then(|| meshes.add(built.grass));
-                for (entity, mesh) in [
-                    (chunk.tree_entity, trees.as_ref()),
-                    (chunk.grass_entity, grass.as_ref()),
-                ] {
-                    let mut entity = commands.entity(entity);
-                    if let Some(mesh) = mesh {
-                        entity.insert(Mesh3d(mesh.clone()));
+                if built.parts_changed {
+                    chunk.part_vertices = built.trees.count_vertices()
+                        + built.leaves.count_vertices()
+                        + built.grass.count_vertices()
+                        + built.shadow_grass.count_vertices();
+                    let tree_bounds = crate::wind::bounds(&built.trees);
+                    let leaf_bounds = crate::wind::bounds(&built.leaves);
+                    let grass_bounds = crate::wind::bounds(&built.grass);
+                    let shadow_bounds = crate::wind::bounds(&built.shadow_grass);
+                    chunk.grass_triangles = if chunk.vegetation.refined_grass {
+                        built.shadow_grass.count_vertices() / 3
                     } else {
-                        entity.remove::<Mesh3d>();
+                        built.grass.count_vertices() / 3
+                    };
+                    let trees = (built.trees.count_vertices() > 0).then(|| meshes.add(built.trees));
+                    let leaves =
+                        (built.leaves.count_vertices() > 0).then(|| meshes.add(built.leaves));
+                    let grass = (built.grass.count_vertices() > 0).then(|| meshes.add(built.grass));
+                    let shadow_grass = (built.shadow_grass.count_vertices() > 0)
+                        .then(|| meshes.add(built.shadow_grass));
+                    for (entity, mesh, bounds) in [
+                        (chunk.tree_entity, trees.as_ref(), tree_bounds),
+                        (chunk.leaf_entity, leaves.as_ref(), leaf_bounds),
+                        (chunk.grass_entity, grass.as_ref(), grass_bounds),
+                    ] {
+                        let mut entity = commands.entity(entity);
+                        if let Some(mesh) = mesh {
+                            entity.insert((Mesh3d(mesh.clone()), bounds));
+                        } else {
+                            entity.remove::<Mesh3d>();
+                        }
                     }
-                }
-                commands
-                    .entity(chunk.grass_entity)
-                    .insert(if *layer == MapLayer::Natural {
-                        Visibility::Inherited
-                    } else {
-                        Visibility::Hidden
-                    });
-                for id in &chunk.vegetation_meshes {
-                    meshes.remove(*id);
-                }
-                chunk
-                    .meshes
-                    .retain(|id| !chunk.vegetation_meshes.contains(id));
-                chunk.vegetation_meshes = [trees.as_ref(), grass.as_ref()]
+                    if chunk.grass_shadow_entity != chunk.grass_entity {
+                        let mut entity = commands.entity(chunk.grass_shadow_entity);
+                        if let Some(mesh) = shadow_grass.as_ref() {
+                            entity.insert((Mesh3d(mesh.clone()), shadow_bounds));
+                        } else {
+                            entity.remove::<Mesh3d>();
+                        }
+                        entity.insert(if *layer == MapLayer::Natural {
+                            Visibility::Inherited
+                        } else {
+                            Visibility::Hidden
+                        });
+                    }
+                    commands
+                        .entity(chunk.grass_entity)
+                        .insert(if *layer == MapLayer::Natural {
+                            Visibility::Inherited
+                        } else {
+                            Visibility::Hidden
+                        });
+                    for id in &chunk.part_meshes {
+                        meshes.remove(*id);
+                    }
+                    chunk.meshes.retain(|id| !chunk.part_meshes.contains(id));
+                    chunk.part_meshes = [
+                        trees.as_ref(),
+                        leaves.as_ref(),
+                        grass.as_ref(),
+                        shadow_grass.as_ref(),
+                    ]
                     .into_iter()
                     .flatten()
                     .map(|m| m.id())
                     .collect();
-                chunk.meshes.extend(chunk.vegetation_meshes.iter().copied());
-                chunk.bytes = chunk.bytes - chunk.vegetation_vertices * 40 + built.vertices * 40;
-                chunk.vegetation_vertices = built.vertices;
-                chunk.levels = built.levels;
+                    chunk.meshes.extend(chunk.part_meshes.iter().copied());
+                }
+                let request = built.request.take().unwrap();
+                let tree_changed =
+                    request.trees != chunk.request.trees || !built.tree_additions.is_empty();
+                if tree_changed {
+                    let (removed, added) = install_tree_lods(
+                        &mut commands,
+                        &mut meshes,
+                        chunk.root,
+                        &chunk.vegetation,
+                        &request.trees,
+                        &mut chunk.tree_lods,
+                        built.tree_additions,
+                        &tree_material,
+                        &leaf_material,
+                    );
+                    chunk.meshes.retain(|id| !removed.contains(id));
+                    chunk.meshes.extend(added);
+                }
+                if let Some(plan) = &request.grass {
+                    let (removed, added) = install_grass_lods(
+                        &mut commands,
+                        &mut meshes,
+                        chunk.root,
+                        plan,
+                        &mut chunk.grass_lods,
+                        built.grass_additions,
+                        &grass_material,
+                        &grass_shadow_material,
+                        *layer == MapLayer::Natural,
+                        chunk.grass_shadows,
+                    );
+                    chunk.meshes.retain(|id| !removed.contains(id));
+                    chunk.meshes.extend(added);
+                    chunk.grass_triangles = chunk
+                        .grass_lods
+                        .iter()
+                        .filter_map(|p| p.pairs[0].as_ref())
+                        .filter_map(|p| p.meshes.get(1))
+                        .map(|id| meshes.get(*id).unwrap().count_vertices() / 3)
+                        .sum();
+                }
+                chunk.vegetation_meshes = chunk
+                    .part_meshes
+                    .iter()
+                    .copied()
+                    .chain(tree_mesh_ids(&chunk.tree_lods))
+                    .chain(tree_mesh_ids(&chunk.grass_lods))
+                    .collect();
+                let vertices = chunk.part_vertices
+                    + tree_vertices(&chunk.tree_lods)
+                    + tree_vertices(&chunk.grass_lods);
+                chunk.bytes = chunk.bytes - chunk.vegetation_vertices * vegetation::VERTEX_BYTES
+                    + vertices * vegetation::VERTEX_BYTES;
+                chunk.vegetation_vertices = vertices;
+                chunk.levels = request.levels;
+                chunk.request = request;
+                stream.tree_lod_rebuilt += u64::from(tree_changed);
                 stream.lod_rebuilt += 1;
                 stream.last_lod_ms = built.elapsed_ms;
                 stream.last_lod_install_ms = start.elapsed().as_secs_f64() * 1000.;
@@ -1543,6 +2136,52 @@ pub fn update(
         }
         // Discarded/unfinished jobs do not spend this budget. One valid install does.
         break;
+    }
+}
+
+// Chunk-level shadow radius: enter at 40m, exit at 56m to avoid toggling
+// while riding near a boundary. Middle/Far never cast refined grass shadows.
+fn grass_shadow_policy(
+    key: ChunkKey,
+    p: Vec2,
+    detail: vegetation::Detail,
+    previous: bool,
+    refined: bool,
+) -> bool {
+    if !refined {
+        return true;
+    }
+    if detail != vegetation::Detail::Near {
+        return false;
+    }
+    let origin = key.origin();
+    let distance = p.distance(p.clamp(origin, origin + Vec2::splat(CHUNK_SIZE)));
+    distance <= if previous { 56. } else { 40. }
+}
+pub fn update_grass_shadows(
+    mut commands: Commands,
+    stream: Option<ResMut<StreamWorld>>,
+    horse: Single<&Transform, With<HorseController>>,
+) {
+    let Some(mut stream) = stream else {
+        return;
+    };
+    let p = Vec2::new(horse.translation.x, horse.translation.z);
+    let refined = stream.generator.refined_grass;
+    for (key, chunk) in &mut stream.loaded {
+        let enabled = chunk.grass_triangles > 0
+            && grass_shadow_policy(*key, p, chunk.grass_detail(), chunk.grass_shadows, refined);
+        if enabled != chunk.grass_shadows {
+            for entity in chunk.grass_shadow_entities() {
+                let mut entity = commands.entity(entity);
+                if enabled {
+                    entity.remove::<bevy::light::NotShadowCaster>();
+                } else {
+                    entity.insert(bevy::light::NotShadowCaster);
+                }
+            }
+            chunk.grass_shadows = enabled;
+        }
     }
 }
 
@@ -1568,6 +2207,7 @@ pub fn schedule(
                 .map(|(t, p, c)| vegetation::View::from_camera(t, p, c))
         })
         .flatten();
+    stream.lod_eye = view.map_or(horse.0.translation, |v| v.position);
     stream.predicted = if stream.priority_enabled {
         motion.predicted
     } else {
@@ -1604,7 +2244,7 @@ pub fn schedule(
             if desired != chunk.surface_detail && !stream.pending_surface.contains_key(key) {
                 jobs.push(Work::Terrain(*key));
             }
-            if chunk.vegetation.levels(view, Some(chunk.levels)) != chunk.levels
+            if chunk.vegetation.stream_request(view, Some(&chunk.request)) != chunk.request
                 && !stream.pending_lod.contains_key(key)
             {
                 jobs.push(Work::Vegetation(*key));
@@ -1648,11 +2288,13 @@ pub fn schedule(
             }
             Work::Vegetation(_) => {
                 let chunk = &stream.loaded[&key];
-                let levels = chunk.vegetation.levels(view, Some(chunk.levels));
+                let previous = chunk.request.clone();
+                let request = chunk.vegetation.stream_request(view, Some(&previous));
                 let data = chunk.vegetation.clone();
                 stream.pending_lod.insert(
                     key,
-                    AsyncComputeTaskPool::get().spawn(async move { data.build(levels) }),
+                    AsyncComputeTaskPool::get()
+                        .spawn(async move { data.build_streamed(request, Some(&previous)) }),
                 );
             }
         }
@@ -1687,7 +2329,7 @@ pub fn generation_report(generator: Generator, settings: TreeSettings) {
     std::fs::write(&path,format!("seed,stream_generator_version,mountain_strength,retained_chunks,chunk_width_m,grid_side,cell_size_m,total_wall_ms,mean_chunk_ms,max_chunk_ms,cpu_mesh_mib,trees,process_cpu_ms,rss_delta_mib\n{},{},{},9,{},{},{},{wall:.3},{mean:.3},{maximum:.3},{mib:.3},{tree_count},{},{}\n",generator.seed,VERSION,generator.settings.mountain_strength,CHUNK_SIZE,SIDE,CELL,optional(usage.cpu_ms),optional(usage.rss_delta_mib))).expect("Cannot save streaming report");
     // Compare vegetation-only mesh construction on identical immutable blueprints.
     let mut csv = String::from(
-        "detail,chunks,trees,tree_vertices,grass_vertices,vegetation_mesh_mib,blueprint_mib,mesh_build_ms\n",
+        "detail,chunks,trees,tree_vertices,grass_vertices,shadow_vertices,vegetation_mesh_mib,blueprint_mib,mesh_build_ms\n",
     );
     for detail in [
         vegetation::Detail::Near,
@@ -1697,18 +2339,20 @@ pub fn generation_report(generator: Generator, settings: TreeSettings) {
         let start = Instant::now();
         let mut tree_vertices = 0;
         let mut grass_vertices = 0;
+        let mut shadow_vertices = 0;
         for chunk in &chunks {
             let built = chunk.vegetation.build(Levels {
                 trees: detail,
                 grass: detail,
             });
-            tree_vertices += built.trees.count_vertices();
+            tree_vertices += built.trees.count_vertices() + built.leaves.count_vertices();
             grass_vertices += built.grass.count_vertices();
+            shadow_vertices += built.shadow_grass.count_vertices();
         }
         let wall = start.elapsed().as_secs_f64() * 1000.;
         let descriptors =
             chunks.iter().map(|c| c.vegetation.bytes()).sum::<usize>() as f64 / (1024. * 1024.);
-        csv.push_str(&format!("{detail:?},9,{tree_count},{tree_vertices},{grass_vertices},{:.3},{descriptors:.3},{wall:.3}\n", (tree_vertices + grass_vertices) as f64 * 40. / (1024. * 1024.)));
+        csv.push_str(&format!("{detail:?},9,{tree_count},{tree_vertices},{grass_vertices},{shadow_vertices},{:.3},{descriptors:.3},{wall:.3}\n", (tree_vertices + grass_vertices + shadow_vertices) as f64 * vegetation::VERTEX_BYTES as f64 / (1024. * 1024.)));
     }
     std::fs::write(
         format!("reports/vegetation-lod-seed-{}.csv", generator.seed),
@@ -2120,7 +2764,12 @@ mod tests {
                     assert_eq!(built.grass.count_vertices(), 0);
                 }
                 let repeated = data.build(built.levels);
-                for mesh in [&built.trees, &built.grass] {
+                for mesh in [
+                    &built.trees,
+                    &built.leaves,
+                    &built.grass,
+                    &built.shadow_grass,
+                ] {
                     let Some(VertexAttributeValues::Float32x3(points)) =
                         mesh.attribute(Mesh::ATTRIBUTE_POSITION)
                     else {
@@ -2160,7 +2809,56 @@ mod tests {
                     );
                 }
             }
-            assert!(last < full.vertices / 5);
+            // Dense Far conifers keep every outer bough, avoiding a cone-to-
+            // needles silhouette jump. Still require at least a 3x reduction.
+            assert!(last < full.vertices / 3);
+        }
+    }
+    #[test]
+    fn grass_meadows_are_dense_grounded_and_repeatable_with_open_land() {
+        for seed in [42, 20261003, 314159] {
+            let g = Generator::new(seed, TerrainSettings::default());
+            let mut tall = 0;
+            let mut short = 0;
+            for key in [ChunkKey(0, 0), ChunkKey(-1, -1), ChunkKey(1, 0)] {
+                let chunk = generate(g.clone(), key, TreeSettings::default());
+                let grass = &chunk.vegetation.grass;
+                assert!(grass.len() <= crate::grassfield::MAX_TUFTS);
+                let fields = crate::grassfield::Fields::new(seed, key.origin());
+                for b in grass {
+                    let root = (b.a + b.b) * 0.5;
+                    let p = key.origin() + Vec2::new(root.x, root.z);
+                    let height = b.c.y - root.y;
+                    assert_eq!(ChunkKey::at(p), key);
+                    assert!((root.y - g.ground(p)).abs() < 0.001);
+                    assert!(g.water_depth(p) < -0.015);
+                    assert!((0.349..=1.301).contains(&height));
+                    if height > 0.75 {
+                        tall += 1;
+                        assert!(fields.strength(p) > 0.);
+                        assert!(!g.hydrology.ford_route(p));
+                    } else if fields.strength(p) == 0. {
+                        short += 1;
+                        assert!(height <= 0.551);
+                    }
+                }
+                if key == ChunkKey(0, 0) {
+                    g.hydrology.retain(&BTreeSet::new());
+                    let again = generate(g.clone(), key, TreeSettings::default());
+                    assert_eq!(*grass, again.vegetation.grass);
+                    for detail in [vegetation::Detail::Middle, vegetation::Detail::Far] {
+                        let mesh = chunk.vegetation.build(Levels {
+                            trees: detail,
+                            grass: detail,
+                        });
+                        assert!(mesh.grass.count_vertices() < grass.len() * 18);
+                    }
+                }
+            }
+            assert!(
+                tall > 300 && short > 20,
+                "seed {seed}, tall {tall}, short {short}"
+            );
         }
     }
     #[test]
@@ -2215,6 +2913,50 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn grass_shadows_use_distance_hysteresis_near_detail_and_legacy_override() {
+        let key = ChunkKey(0, 0);
+        let near = vegetation::Detail::Near;
+        for distance in [0., 39., 40.] {
+            assert!(grass_shadow_policy(
+                key,
+                Vec2::new(CHUNK_SIZE + distance, 48.),
+                near,
+                false,
+                true
+            ));
+        }
+        for distance in [41., 48., 56.] {
+            let p = Vec2::new(CHUNK_SIZE + distance, 48.);
+            assert!(!grass_shadow_policy(key, p, near, false, true));
+            assert!(grass_shadow_policy(key, p, near, true, true));
+        }
+        assert!(!grass_shadow_policy(
+            key,
+            Vec2::new(CHUNK_SIZE + 57., 48.),
+            near,
+            true,
+            true
+        ));
+        for detail in [vegetation::Detail::Middle, vegetation::Detail::Far] {
+            assert!(!grass_shadow_policy(key, Vec2::ZERO, detail, true, true));
+            assert!(grass_shadow_policy(
+                key,
+                Vec2::splat(1000.),
+                detail,
+                false,
+                false
+            ));
+        }
+        assert!(grass_shadow_policy(
+            ChunkKey(-1, -1),
+            Vec2::splat(-48.),
+            near,
+            false,
+            true
+        ));
+    }
+
     fn test_stream(priority: bool) -> (App, Entity, Entity) {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins)
@@ -2227,8 +2969,11 @@ mod tests {
             .init_resource::<crate::LabState>()
             .init_resource::<Assets<Mesh>>()
             .init_resource::<Assets<StandardMaterial>>()
-            .add_systems(Startup, setup)
-            .add_systems(Update, (update, schedule).chain());
+            .init_resource::<Assets<crate::wind::VegetationMaterial>>()
+            .init_resource::<Assets<Image>>()
+            .init_resource::<crate::wind::Config>()
+            .add_systems(Startup, (crate::wind::setup, setup).chain())
+            .add_systems(Update, (update, schedule, update_grass_shadows).chain());
         let horse = app
             .world_mut()
             .spawn((
@@ -2435,8 +3180,40 @@ mod tests {
                 );
                 assert!(stream.loaded_count() <= MAX_CHUNKS && stream.pending_count() <= MAX_TASKS);
                 assert!(stream.watershed_count() <= 13);
-                assert!(app.world().resource::<Assets<Mesh>>().len() <= MAX_CHUNKS * 6);
+                assert!(
+                    app.world().resource::<Assets<Mesh>>().len()
+                        <= MAX_CHUNKS * (8 + vegetation::GRASS_PATCH_COUNT * 3)
+                            + stream.tree_count() * 6
+                );
+                assert_eq!(
+                    app.world().resource::<Assets<Mesh>>().len(),
+                    stream.mesh_asset_count()
+                );
                 if stream.loaded_count() == MAX_CHUNKS && stream.pending_count() == 0 {
+                    let horse = app.world().get::<Transform>(horse).unwrap().translation;
+                    let p = Vec2::new(horse.x, horse.z);
+                    for (key, chunk) in &stream.loaded {
+                        let expected = chunk.grass_triangles > 0
+                            && grass_shadow_policy(
+                                *key,
+                                p,
+                                chunk.grass_detail(),
+                                chunk.grass_shadows,
+                                true,
+                            );
+                        assert_eq!(chunk.grass_shadows, expected);
+                        assert_eq!(
+                            app.world()
+                                .get::<bevy::light::NotShadowCaster>(chunk.grass_shadow_entity)
+                                .is_none(),
+                            expected
+                        );
+                        assert!(
+                            app.world()
+                                .get::<bevy::light::TransmittedShadowReceiver>(chunk.grass_entity)
+                                .is_some()
+                        );
+                    }
                     break;
                 }
                 assert!(
@@ -2507,9 +3284,97 @@ mod tests {
         let assets = app.world().resource::<Assets<Mesh>>();
         assert_eq!(assets.len(), stream.mesh_asset_count());
         assert!(
-            ids.iter().all(|id| assets.get(*id).is_none()),
-            "Replaced LOD assets must be freed"
+            ids.iter().all(|id| assets.get(*id).is_some()
+                == stream.loaded[&ChunkKey(0, 0)].meshes.contains(id)),
+            "Kept levels retain handles; expired levels must be freed"
         );
+        // At 180m elevation all patches correctly cull. Return near ground
+        // before checking that real grass assets remain stable on rotation.
+        *app.world_mut().get_mut::<Transform>(camera).unwrap() =
+            Transform::from_xyz(32., 8., 54.).looking_at(Vec3::new(32., 1., 40.), Vec3::Y);
+        settle(&mut app);
+        let stream = app.world().resource::<StreamWorld>();
+        let assets = app.world().resource::<Assets<Mesh>>();
+        let tree_ids: Vec<_> = stream
+            .loaded
+            .values()
+            .flat_map(|c| tree_mesh_ids(&c.tree_lods))
+            .collect();
+        let grass_ids: Vec<_> = stream
+            .loaded
+            .values()
+            .flat_map(|c| tree_mesh_ids(&c.grass_lods))
+            .collect();
+        assert!(!grass_ids.is_empty());
+        let before_grass_vertices: usize = stream
+            .loaded
+            .values()
+            .map(|c| tree_vertices(&c.grass_lods))
+            .sum();
+        for chunk in stream.loaded.values() {
+            assert_eq!(
+                chunk.vegetation_vertices,
+                chunk.part_vertices
+                    + tree_vertices(&chunk.tree_lods)
+                    + tree_vertices(&chunk.grass_lods)
+            );
+            for pair in chunk
+                .grass_lods
+                .iter()
+                .flat_map(|p| p.pairs.iter().flatten())
+            {
+                for id in &pair.meshes {
+                    assert!(assets.get(*id).unwrap().count_vertices() > 0);
+                }
+            }
+        }
+        let before_tree_installs = stream.tree_lod_rebuilt;
+        let before_vertices: usize = stream
+            .loaded
+            .values()
+            .map(|c| tree_vertices(&c.tree_lods))
+            .sum();
+        for angle in [0.4, 1.6, 3.2, 5.8] {
+            app.world_mut()
+                .get_mut::<Transform>(camera)
+                .unwrap()
+                .rotation = Quat::from_rotation_y(angle);
+            settle(&mut app);
+            let stream = app.world().resource::<StreamWorld>();
+            assert_eq!(before_tree_installs, stream.tree_lod_rebuilt);
+            assert_eq!(
+                grass_ids,
+                stream
+                    .loaded
+                    .values()
+                    .flat_map(|c| tree_mesh_ids(&c.grass_lods))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                before_grass_vertices,
+                stream
+                    .loaded
+                    .values()
+                    .map(|c| tree_vertices(&c.grass_lods))
+                    .sum::<usize>()
+            );
+            assert_eq!(
+                tree_ids,
+                stream
+                    .loaded
+                    .values()
+                    .flat_map(|c| tree_mesh_ids(&c.tree_lods))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                before_vertices,
+                stream
+                    .loaded
+                    .values()
+                    .map(|c| tree_vertices(&c.tree_lods))
+                    .sum::<usize>()
+            );
+        }
         let old = app.world().resource::<StreamWorld>().loaded[&ChunkKey(0, 0)].root;
         let trees = app.world().resource::<StreamWorld>().loaded[&ChunkKey(0, 0)]
             .trees

@@ -1,10 +1,7 @@
 use crate::environment::MapLayer;
 use crate::terrain::{AREA_SCALE, EXTENT, Meadow, PLACEMENT_EXTENT, PLAY_RADIUS, SeedRandom};
 use crate::trees::{TreeSettings, shapes};
-use bevy::{
-    asset::RenderAssetUsages, light::CascadeShadowConfigBuilder, mesh::Indices, prelude::*,
-    render::render_resource::PrimitiveTopology,
-};
+use bevy::{light::CascadeShadowConfigBuilder, prelude::*};
 
 #[derive(Component)]
 pub struct Canopy {
@@ -28,6 +25,7 @@ pub fn setup(
     tree_settings: Res<TreeSettings>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    plants: Res<crate::wind::Materials>,
 ) {
     if !world.is_streaming() {
         commands.spawn((
@@ -40,6 +38,7 @@ pub fn setup(
         ));
     }
     commands.spawn((
+        bevy::camera::visibility::RenderLayers::from_layers(&[0, 1]),
         DirectionalLight {
             illuminance: 11000.0,
             shadow_maps_enabled: true,
@@ -56,32 +55,48 @@ pub fn setup(
     if !world.is_streaming() {
         let leaf_template = Sphere::new(1.0).mesh().ico(1).unwrap();
         let leaves = meshes.add(leaf_template.clone());
-        // Vertex colors allow restrained per-tree hues with one shared material.
-        let tree_material = materials.add(StandardMaterial {
-            base_color: Color::WHITE,
-            perceptual_roughness: 1.0,
-            ..default()
-        });
         for ((p, _), tree) in world.trees.iter().zip(shapes(&world, *tree_settings)) {
             let base = Vec3::new(p.x, world.ground(*p), p.y);
-            commands.spawn((
-                Name::new(format!(
-                    "Tree {} / {:?} / trunk and branches",
-                    tree.seed, tree.species
-                )),
-                Mesh3d(meshes.add(tree.wood_mesh())),
-                MeshMaterial3d(tree_material.clone()),
-                Transform::from_translation(base),
-            ));
-            commands.spawn((
-                Name::new(format!("Tree {} / crown", tree.seed)),
-                Mesh3d(meshes.add(tree.crown_mesh(&leaf_template))),
-                MeshMaterial3d(tree_material.clone()),
-                Transform::from_translation(base + tree.crown_pivot),
-                Canopy {
-                    phase: tree.seed as f32 / u32::MAX as f32 * std::f32::consts::TAU,
-                },
-            ));
+            let height = tree.trunk.last().unwrap().0.y;
+            for (name, mesh, offset, material, amplitude) in [
+                (
+                    "wood",
+                    tree.wood_mesh_lod(crate::vegetation::Detail::Near),
+                    Vec3::ZERO,
+                    plants.wood.clone(),
+                    0.,
+                ),
+                (
+                    "foliage",
+                    tree.foliage_mesh(crate::vegetation::Detail::Near),
+                    tree.crown_pivot,
+                    if tree.species == crate::trees::Species::Conifer {
+                        plants.wood.clone()
+                    } else {
+                        plants.leaves.clone()
+                    },
+                    tree.foliage_wind_amplitude(crate::vegetation::Detail::Near),
+                ),
+            ] {
+                let mut batch = crate::streaming::Batch::default();
+                batch.append_wind(
+                    mesh,
+                    offset,
+                    0.,
+                    height,
+                    tree.seed as f32 / u32::MAX as f32 * std::f32::consts::TAU,
+                    amplitude,
+                );
+                let mesh = batch.mesh();
+                let bounds = crate::wind::bounds(&mesh);
+                commands.spawn((
+                    Name::new(format!("Tree {} / {:?} / {name}", tree.seed, tree.species)),
+                    Mesh3d(meshes.add(mesh)),
+                    MeshMaterial3d(material),
+                    Transform::from_translation(base),
+                    bounds,
+                ));
+            }
         }
 
         let water_material = materials.add(StandardMaterial {
@@ -129,15 +144,27 @@ pub fn setup(
             ));
         }
 
-        commands.spawn((
-            Grass,
-            Mesh3d(meshes.add(grass_mesh(&world))),
-            MeshMaterial3d(materials.add(StandardMaterial {
-                cull_mode: None,
-                perceptual_roughness: 1.0,
-                ..default()
-            })),
-        ));
+        let [grass, shadow] = grass_mesh(&world);
+        for (mesh, material, proxy) in [
+            (grass, plants.grass.clone(), false),
+            (shadow, plants.shadow_grass.clone(), true),
+        ] {
+            let bounds = crate::wind::bounds(&mesh);
+            let mut entity = commands.spawn((
+                Grass,
+                Mesh3d(meshes.add(mesh)),
+                MeshMaterial3d(material),
+                bounds,
+            ));
+            if proxy {
+                entity.insert(bevy::camera::visibility::RenderLayers::layer(1));
+            } else {
+                entity.insert((
+                    bevy::light::NotShadowCaster,
+                    bevy::light::TransmittedShadowReceiver,
+                ));
+            }
+        }
     }
     let cloud_mesh = meshes.add(Sphere::new(1.0).mesh().ico(2).unwrap());
     let cloud_material = materials.add(StandardMaterial {
@@ -201,59 +228,38 @@ pub fn drift_clouds(
     }
 }
 
-fn grass_mesh(world: &Meadow) -> Mesh {
+fn grass_mesh(world: &Meadow) -> [Mesh; 2] {
     let mut random = SeedRandom(world.seed ^ 0xa15d_2357);
-    let mut positions = vec![];
-    let mut normals = vec![];
-    let mut colors = vec![];
-    let mut indices = vec![];
-    for _ in 0..6000 * AREA_SCALE {
+    let mut batch = crate::streaming::Batch::default();
+    let mut shadow = crate::streaming::Batch::default();
+    for index in 0..6000 * AREA_SCALE {
         let p = Vec2::new(
             random.range(-PLAY_RADIUS, PLAY_RADIUS),
             random.range(-PLAY_RADIUS, PLAY_RADIUS),
         );
-        if world.near_water(p, 1.0) {
-            continue;
-        }
-        if world.slope(p) > 0.75 {
+        if world.near_water(p, 1.) || world.slope(p) > 0.75 {
             continue;
         }
         let habitat = world.environment_at(p);
-        if random.unit() > habitat.grass_density * (1.0 - habitat.tree_density * 0.35) {
+        if random.unit() > habitat.grass_density * (1. - habitat.tree_density * 0.35) {
             continue;
         }
         let h = world.ground(p);
-        let angle = random.range(0.0, std::f32::consts::TAU);
-        let blade_height = random.range(0.15, 0.45) * (0.75 + habitat.moisture * 0.5);
-        let base_color =
-            Vec3::new(0.30, 0.33, 0.09).lerp(Vec3::new(0.14, 0.35, 0.07), habitat.moisture);
-        let tip_color =
-            Vec3::new(0.52, 0.51, 0.23).lerp(Vec3::new(0.36, 0.58, 0.16), habitat.moisture);
-        for turn in [0.0, 1.2, 2.4] {
-            let dir = Vec2::new((angle + turn).cos(), (angle + turn).sin()) * 0.06;
-            let a = Vec3::new(p.x - dir.x, h, p.y - dir.y);
-            let b = Vec3::new(p.x + dir.x, h, p.y + dir.y);
-            let c = Vec3::new(p.x + dir.x * 1.5, h + blade_height, p.y + dir.y * 1.5);
-            let start = positions.len() as u32;
-            let normal = (b - a).cross(c - a).normalize();
-            positions.extend([a.to_array(), b.to_array(), c.to_array()]);
-            normals.extend([normal.to_array(); 3]);
-            colors.extend([
-                [base_color.x, base_color.y, base_color.z, 1.0],
-                [base_color.x, base_color.y, base_color.z, 1.0],
-                [tip_color.x, tip_color.y, tip_color.z, 1.0],
-            ]);
-            indices.extend([start, start + 1, start + 2]);
-        }
+        let angle = random.range(0., std::f32::consts::TAU);
+        let height = random.range(0.15, 0.45) * (0.75 + habitat.moisture * 0.5);
+        let color = Vec3::new(0.30, 0.33, 0.09).lerp(Vec3::new(0.14, 0.35, 0.07), habitat.moisture);
+        let root = Vec3::new(p.x, h, p.y);
+        let side = Vec3::new(angle.cos(), 0., angle.sin()) * 0.09;
+        let blade = crate::vegetation::Blade {
+            a: root - side,
+            b: root + side,
+            c: root + Vec3::Y * height,
+            color: [color.x, color.y, color.z, 1.],
+        };
+        crate::vegetation::build_tuft(&mut batch, &blade, index, crate::vegetation::Detail::Near);
+        crate::vegetation::build_shadow_tuft(&mut shadow, &blade, index);
     }
-    Mesh::new(
-        PrimitiveTopology::TriangleList,
-        RenderAssetUsages::default(),
-    )
-    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
-    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
-    .with_inserted_indices(Indices::U32(indices))
+    [batch.mesh(), shadow.mesh()]
 }
 
 type TerrainViews<'w, 's> = Query<

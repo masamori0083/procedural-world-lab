@@ -63,6 +63,11 @@ impl Default for CameraRig {
 }
 
 impl CameraRig {
+    pub(crate) fn frame_meadow_overview(&mut self) {
+        self.mode = ViewMode::Overview;
+        self.overview_height = 48.;
+        self.snap = true;
+    }
     pub(crate) fn frame_tree(&mut self) {
         self.mode = ViewMode::ThirdPerson;
         self.third_pitch = 0.;
@@ -489,6 +494,11 @@ pub fn update_hud(
             stream.last_install_ms,
             layer.legend()
         );
+        let (casters, meshes, _) = stream.grass_shadow_stats();
+        hud.0.push_str(&format!(
+            "\nGrass {} | Shadow chunks {casters}/{meshes}",
+            stream.grass_look()
+        ));
         return;
     }
     let text = format!(
