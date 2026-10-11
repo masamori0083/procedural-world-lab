@@ -149,6 +149,7 @@ pub fn args() -> Vec<String> {
 #[allow(clippy::too_many_arguments)]
 pub fn ready(
     lab: Res<crate::LabState>,
+    rig: Res<crate::player::CameraRig>,
     world: Res<crate::terrain::Meadow>,
     diagnostics: Res<bevy::diagnostic::DiagnosticsStore>,
     stream: Option<Res<crate::streaming::StreamWorld>>,
@@ -191,8 +192,13 @@ pub fn ready(
             let _ = status.set_attribute("data-render-size", &format!("{}x{}", size.x, size.y));
             let _ = status.set_attribute("data-frame-p95-ms", &format!("{p95:.2}"));
             let _ = status.set_attribute("data-generation-slice-ms", &format!("{slice:.2}"));
+            let interaction = if rig.captured {
+                "Exploring · Esc releases the mouse."
+            } else {
+                "Paused preview · Click map to explore."
+            };
             status.set_text_content(Some(&format!(
-                "Seed {} · {fps}{memory} · Frame p95 {p95:.1} ms · Generation slice {slice:.1} ms · 3D {}×{} · Click map to explore; Esc releases the mouse.",
+                "Seed {} · {fps}{memory} · Frame p95 {p95:.1} ms · Generation slice {slice:.1} ms · 3D {}×{} · {interaction}",
                 world.seed, size.x, size.y
             )));
         }
@@ -202,5 +208,76 @@ pub fn ready(
             }
             *notified = true;
         }
+    }
+}
+
+// Keep the existing render-target image while a paused view is settled. The
+// native-resolution HUD stays live; input/resize/stream changes refresh 3D.
+#[derive(Default)]
+pub struct PausedPreview {
+    frame: Option<PreviewFrame>,
+    changed_at: f64,
+}
+#[derive(PartialEq)]
+struct PreviewFrame {
+    pose: Mat4,
+    projection: Mat4,
+    size: UVec2,
+    revision: [u64; 3],
+    layer: crate::environment::MapLayer,
+}
+#[allow(clippy::too_many_arguments)]
+pub fn pace_render(
+    lab: Res<crate::LabState>,
+    rig: Res<crate::player::CameraRig>,
+    mut settings: ResMut<bevy::winit::WinitSettings>,
+    mut loaded: Local<bool>,
+    stream: Option<Res<crate::streaming::StreamWorld>>,
+    surface: Res<RenderSurface>,
+    images: Res<Assets<Image>>,
+    time: Res<Time<Real>>,
+    layer: Res<crate::environment::MapLayer>,
+    camera: Single<(&mut Camera, &Transform, &Projection), With<Camera3d>>,
+    mut preview: Local<PausedPreview>,
+) {
+    *loaded |= lab.ready;
+    let foreground = web_sys::window()
+        .and_then(|w| w.document())
+        .is_some_and(|d| !d.hidden() && d.has_focus().unwrap_or(false));
+    let mode = crate::work_budget::browser_frame_wait(*loaded, rig.captured, foreground).map_or(
+        bevy::winit::UpdateMode::Continuous,
+        bevy::winit::UpdateMode::reactive_low_power,
+    );
+    if settings.focused_mode != mode || settings.unfocused_mode != mode {
+        settings.focused_mode = mode;
+        settings.unfocused_mode = mode;
+    }
+    let (mut camera, transform, projection) = camera.into_inner();
+    let current = PreviewFrame {
+        pose: transform.to_matrix(),
+        projection: projection.get_clip_from_view(),
+        size: images.get(&surface.0).map_or(UVec2::ZERO, Image::size),
+        revision: stream
+            .as_ref()
+            .map_or([0; 3], |s| [s.generated, s.lod_rebuilt, s.terrain_rebuilt]),
+        layer: *layer,
+    };
+    let unchanged = stream.as_ref().is_none_or(|s| s.pending_count() == 0)
+        && preview.frame.as_ref() == Some(&current);
+    let now = time.elapsed_secs_f64();
+    if !unchanged {
+        preview.changed_at = now;
+    }
+    let draw = crate::work_budget::browser_draw_scene(
+        *loaded,
+        rig.captured && foreground,
+        unchanged,
+        now - preview.changed_at,
+    );
+    if draw {
+        preview.frame = Some(current);
+    }
+    if camera.is_active != draw {
+        camera.is_active = draw;
     }
 }

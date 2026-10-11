@@ -270,7 +270,8 @@ fn main() {
     #[cfg(target_arch = "wasm32")]
     app.add_systems(Startup, web::setup_render.after(streaming::setup))
         .add_systems(PreUpdate, web::resize_render)
-        .add_systems(Update, web::ready.after(animals::prepare));
+        .add_systems(Update, web::ready.after(animals::prepare))
+        .add_systems(Update, web::pace_render.after(wind::animate));
     if stream_smoke {
         std::fs::create_dir_all(format!("captures/stream-seed-{seed}"))
             .expect("Cannot create captures directory");

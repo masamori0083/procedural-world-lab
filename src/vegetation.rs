@@ -560,7 +560,14 @@ impl Blueprint {
                 wood + s.full_foliage_vertices()
             })
             .sum::<usize>()
-            + self.grass.len() * if self.refined_grass { 120 } else { 18 }
+            + self.grass.len()
+                * if !self.refined_grass {
+                    18
+                } else if cfg!(target_arch = "wasm32") {
+                    84 // 24 visual triangles + the unchanged 4-triangle proxy.
+                } else {
+                    120
+                }
             + self.shrubs.len() * 1440
     }
     pub fn bytes(&self) -> usize {
@@ -724,6 +731,26 @@ fn build_ribbons_scaled(
     shadow: bool,
     width_scale: f32,
 ) {
+    build_ribbons_profile(
+        batch,
+        blade,
+        index,
+        detail,
+        shadow,
+        width_scale,
+        cfg!(target_arch = "wasm32"),
+    );
+}
+// Explicit profile lets native regression tests exercise the Web geometry too.
+fn build_ribbons_profile(
+    batch: &mut Batch,
+    blade: &Blade,
+    index: usize,
+    detail: Detail,
+    shadow: bool,
+    width_scale: f32,
+    compact: bool,
+) {
     let root = (blade.a + blade.b) * 0.5;
     let height = blade.c.y - root.y;
     let base_side = (blade.b - blade.a).normalize();
@@ -747,6 +774,11 @@ fn build_ribbons_scaled(
         };
         let stations: &[(f32, f32)] = if shadow {
             &[(0., 0.5), (1., 0.04)]
+        } else if compact {
+            // Keep all six seeded blades, the widest ring and the blunt tip.
+            // Omitting the upper intermediate ring saves 1/3 of Web visual
+            // vertices/triangles; the maximum bend error is < 5% of height.
+            &[(0., 0.5), (0.45, 1.), (1., 0.04)]
         } else {
             &[(0., 0.5), (0.45, 1.), (0.85, 0.5), (1., 0.04)]
         };
@@ -1237,6 +1269,107 @@ mod tests {
         }
     }
 
+    #[test]
+    fn web_grass_reduces_segments_without_dropping_seeded_blades_or_tips() {
+        use bevy::mesh::VertexAttributeValues;
+        let blade = Blade {
+            a: Vec3::new(2.91, 4., 7.),
+            b: Vec3::new(3.09, 4., 7.),
+            c: Vec3::new(3., 5.1, 7.),
+            color: [0.2, 0.35, 0.1, 1.],
+        };
+        for (detail, ribbons) in [(Detail::Near, 6), (Detail::Middle, 3)] {
+            let mesh = |compact| {
+                let mut batch = Batch::default();
+                build_ribbons_profile(&mut batch, &blade, 17, detail, false, 1., compact);
+                batch.mesh()
+            };
+            let full = mesh(false);
+            let compact = mesh(true);
+            assert_eq!(full.count_vertices(), ribbons * 18);
+            assert_eq!(compact.count_vertices(), ribbons * 12);
+            // Same roots, widest cross section, tips, normals, colors and GPU
+            // wind phase/amplitude. Only the upper intermediate ring is gone.
+            for attribute in [Mesh::ATTRIBUTE_POSITION, Mesh::ATTRIBUTE_NORMAL] {
+                let Some(VertexAttributeValues::Float32x3(a)) = full.attribute(attribute) else {
+                    panic!()
+                };
+                let Some(VertexAttributeValues::Float32x3(b)) = compact.attribute(attribute) else {
+                    panic!()
+                };
+                for (old, new) in a.chunks_exact(18).zip(b.chunks_exact(12)) {
+                    assert_eq!(&old[..6], &new[..6]);
+                    assert_eq!(old[14], new[8]);
+                    assert_eq!(old[17], new[11]);
+                }
+            }
+            for attribute in [Mesh::ATTRIBUTE_UV_0, Mesh::ATTRIBUTE_UV_1] {
+                let Some(VertexAttributeValues::Float32x2(a)) = full.attribute(attribute) else {
+                    panic!()
+                };
+                let Some(VertexAttributeValues::Float32x2(b)) = compact.attribute(attribute) else {
+                    panic!()
+                };
+                for (old, new) in a.chunks_exact(18).zip(b.chunks_exact(12)) {
+                    assert_eq!(&old[..6], &new[..6]);
+                    assert_eq!(old[14], new[8]);
+                    assert_eq!(old[17], new[11]);
+                }
+            }
+            let Some(VertexAttributeValues::Float32x4(a)) = full.attribute(Mesh::ATTRIBUTE_COLOR)
+            else {
+                panic!()
+            };
+            let Some(VertexAttributeValues::Float32x4(b)) =
+                compact.attribute(Mesh::ATTRIBUTE_COLOR)
+            else {
+                panic!()
+            };
+            for (old, new) in a.chunks_exact(18).zip(b.chunks_exact(12)) {
+                assert_eq!(&old[..6], &new[..6]);
+                assert_eq!(old[14], new[8]);
+                assert_eq!(old[17], new[11]);
+            }
+            let Some(VertexAttributeValues::Float32x3(a)) =
+                full.attribute(Mesh::ATTRIBUTE_POSITION)
+            else {
+                panic!()
+            };
+            let Some(VertexAttributeValues::Float32x3(b)) =
+                compact.attribute(Mesh::ATTRIBUTE_POSITION)
+            else {
+                panic!()
+            };
+            for (old, new) in a.chunks_exact(18).zip(b.chunks_exact(12)) {
+                let center = |p: &[[f32; 3]], left, right| {
+                    (Vec3::from_array(p[left]) + Vec3::from_array(p[right])) * 0.5
+                };
+                let lower = center(new, 6, 7);
+                let tip = center(new, 8, 11);
+                let simplified = lower.lerp(tip, (0.85 - 0.45) / (1. - 0.45));
+                assert!(simplified.distance(center(old, 8, 11)) < (blade.c.y - blade.a.y) * 0.05);
+            }
+            assert_eq!(
+                compact.attribute(Mesh::ATTRIBUTE_POSITION),
+                mesh(true).attribute(Mesh::ATTRIBUTE_POSITION)
+            );
+            let Some(VertexAttributeValues::Float32x3(p)) =
+                compact.attribute(Mesh::ATTRIBUTE_POSITION)
+            else {
+                panic!()
+            };
+            assert!(p.iter().all(|p| Vec3::from_array(*p).is_finite()));
+        }
+        let proxy = |compact| {
+            let mut batch = Batch::default();
+            build_ribbons_profile(&mut batch, &blade, 17, Detail::Near, true, 1., compact);
+            batch.mesh()
+        };
+        assert_eq!(
+            proxy(false).attribute(Mesh::ATTRIBUTE_POSITION),
+            proxy(true).attribute(Mesh::ATTRIBUTE_POSITION)
+        );
+    }
     #[test]
     fn rounded_leaves_have_bounded_near_cost_blunt_tips_and_smooth_bends() {
         use bevy::mesh::VertexAttributeValues;

@@ -13,6 +13,29 @@ pub fn render_size(width: u32, height: u32) -> bevy::math::UVec2 {
     )
 }
 
+// None means continuous interactive rendering. A paused preview keeps its image,
+// but should not compete with another window's active WebGPU game.
+#[cfg(any(target_arch = "wasm32", test))]
+pub fn browser_frame_wait(
+    loaded: bool,
+    active: bool,
+    foreground: bool,
+) -> Option<std::time::Duration> {
+    if !loaded || (active && foreground) {
+        None
+    } else if foreground {
+        Some(std::time::Duration::from_secs_f64(1. / 15.))
+    } else {
+        Some(std::time::Duration::from_millis(500))
+    }
+}
+
+// Wait for settled geometry and pipeline warmup before reusing a paused view.
+#[cfg(any(target_arch = "wasm32", test))]
+pub fn browser_draw_scene(loaded: bool, playing: bool, unchanged: bool, settled_secs: f64) -> bool {
+    !loaded || playing || !unchanged || settled_secs < 2.
+}
+
 pub struct WorkBudget {
     start: Instant,
     enabled: bool,
@@ -76,6 +99,40 @@ impl Drop for WorkBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn paused_web_view_reuses_the_frame_but_loading_input_and_scene_changes_refresh_it() {
+        assert!(!browser_draw_scene(true, false, true, 3.));
+        assert!(browser_draw_scene(false, false, true, 3.));
+        assert!(browser_draw_scene(true, true, true, 3.));
+        assert!(browser_draw_scene(true, false, false, 3.));
+        assert!(browser_draw_scene(true, false, true, 0.));
+        assert!(browser_draw_scene(true, false, true, 1.9));
+        assert!(!browser_draw_scene(true, false, true, 2.));
+    }
+
+    #[test]
+    fn browser_paused_rendering_yields_gpu_budget_and_resumes_without_limiting_play() {
+        use std::time::Duration;
+        assert_eq!(browser_frame_wait(false, false, true), None);
+        assert_eq!(browser_frame_wait(true, true, true), None);
+        assert_eq!(
+            browser_frame_wait(true, false, true),
+            Some(Duration::from_secs_f64(1. / 15.))
+        );
+        assert_eq!(
+            browser_frame_wait(true, true, false),
+            Some(Duration::from_millis(500))
+        );
+        assert_eq!(
+            browser_frame_wait(true, false, false),
+            Some(Duration::from_millis(500))
+        );
+        // Loading continues promptly, and a streamed ground wait must not
+        // reset the sticky loaded flag or remove the idle/background budget.
+        assert_eq!(browser_frame_wait(false, false, false), None);
+        assert_eq!(browser_frame_wait(true, true, true), None);
+    }
+
     #[test]
     fn render_budget_caps_pixels_without_changing_aspect_or_upscaling() {
         for (width, height) in [(496, 552), (1274, 778), (3840, 2160), (390, 844)] {
