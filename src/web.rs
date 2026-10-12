@@ -81,9 +81,10 @@ pub fn setup_render(
     ));
     for (entity, mut camera) in &mut cameras {
         camera.order = -1;
-        commands
-            .entity(entity)
-            .insert(RenderTarget::Image(image.clone().into()));
+        commands.entity(entity).insert((
+            RenderTarget::Image(image.clone().into()),
+            bevy::core_pipeline::prepass::DepthPrepass,
+        ));
     }
     let display = commands
         .spawn((Camera2d, IsDefaultUiCamera, RenderLayers::layer(31)))

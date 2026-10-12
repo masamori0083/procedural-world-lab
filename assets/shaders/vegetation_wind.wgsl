@@ -2,6 +2,9 @@
 // cutout lookup for distance fading in both color and shadow/depth passes.
 // UV1 is bend amplitude and phase. GPU time never rebinds materials.
 #import bevy_pbr::{mesh_functions, view_transformations::position_world_to_clip, mesh_view_bindings::view}
+#ifdef VISIBILITY_RANGE_DITHER
+#import bevy_pbr::pbr_functions::visibility_range_dither as apply_lod_dither
+#endif
 #ifdef PREPASS_PIPELINE
 #import bevy_pbr::prepass_io::{Vertex, VertexOutput}
 #import bevy_render::globals::Globals
@@ -14,9 +17,6 @@
     pbr_functions::{alpha_discard, apply_pbr_lighting, main_pass_post_lighting_processing},
     pbr_types::{PbrInput, STANDARD_MATERIAL_FLAGS_UNLIT_BIT},
 }
-#ifdef VISIBILITY_RANGE_DITHER
-#import bevy_pbr::pbr_functions::visibility_range_dither
-#endif
 #ifdef GRASS_DIFFUSE_LIGHTING
 #import bevy_pbr::{
     mesh_view_bindings::lights,
@@ -125,7 +125,7 @@ fn grass_lighting(input: PbrInput) -> vec4<f32> {
 @fragment
 fn fragment(in: VertexOutput, @builtin(front_facing) front: bool) -> FragmentOutput {
 #ifdef VISIBILITY_RANGE_DITHER
-    visibility_range_dither(in.position, in.visibility_range_dither);
+    apply_lod_dither(in.position, in.visibility_range_dither);
 #endif
     var input = pbr_input_from_standard_material(in, front);
     input.material.base_color = alpha_discard(input.material, input.material.base_color);
@@ -142,4 +142,16 @@ fn fragment(in: VertexOutput, @builtin(front_facing) front: bool) -> FragmentOut
     out.color = main_pass_post_lighting_processing(input, out.color);
     return out;
 }
+#endif
+
+#ifdef PREPASS_PIPELINE
+#ifdef VISIBILITY_RANGE_DITHER
+#import bevy_pbr::pbr_prepass_functions::prepass_alpha_discard
+// Match forward LOD coverage before writing depth, including alpha-mask LODs.
+@fragment
+fn lod_depth_fragment(in: VertexOutput) {
+    apply_lod_dither(in.position, in.visibility_range_dither);
+    prepass_alpha_discard(in);
+}
+#endif
 #endif

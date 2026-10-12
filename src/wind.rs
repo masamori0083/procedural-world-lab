@@ -68,6 +68,36 @@ fn grass_shadow_defs(defs: &mut Vec<ShaderDefVal>) {
     defs.retain(|def| !matches!(def, ShaderDefVal::Bool(name, _) if name.starts_with("SHADOW_FILTER_METHOD_")));
     defs.push("SHADOW_FILTER_METHOD_HARDWARE_2X2".into());
 }
+#[cfg(any(target_arch = "wasm32", test))]
+fn preserve_lod_depth_discard(
+    descriptor: &mut RenderPipelineDescriptor,
+    mesh_key: bevy::pbr::MeshPipelineKey,
+) {
+    use bevy::pbr::MeshPipelineKey as Key;
+    // Depth-only opaque LOD omits its fragment, and the standard alpha-mask
+    // depth fragment omits visibility dither. Both must match forward coverage
+    // so discarded pixels cannot occlude the complementary LOD or ground.
+    if mesh_key.contains(Key::DEPTH_PREPASS | Key::VISIBILITY_RANGE_DITHER)
+        && !mesh_key.intersects(
+            Key::NORMAL_PREPASS
+                | Key::MOTION_VECTOR_PREPASS
+                | Key::DEFERRED_PREPASS
+                | Key::UNCLIPPED_DEPTH_ORTHO,
+        )
+        && descriptor
+            .fragment
+            .as_ref()
+            .is_none_or(|fragment| fragment.targets.is_empty())
+    {
+        descriptor.fragment = Some(bevy::render::render_resource::FragmentState {
+            shader: descriptor.vertex.shader.clone(),
+            shader_defs: descriptor.vertex.shader_defs.clone(),
+            entry_point: Some("lod_depth_fragment".into()),
+            targets: Vec::new(),
+        });
+    }
+}
+
 impl MaterialExtension for Wind {
     fn vertex_shader() -> ShaderRef {
         "shaders/vegetation_wind.wgsl".into()
@@ -84,6 +114,8 @@ impl MaterialExtension for Wind {
         _layout: &MeshVertexBufferLayoutRef,
         key: MaterialExtensionKey<Self>,
     ) -> Result<(), SpecializedMeshPipelineError> {
+        #[cfg(target_arch = "wasm32")]
+        preserve_lod_depth_discard(descriptor, key.mesh_key);
         // Dense close-up grass pays for shadow filtering at every visible
         // pixel. Keep reception/transmission, but use the study's cheaper
         // filter for grass only. Trees and ground keep the camera's filter.
@@ -257,6 +289,81 @@ pub fn bounds(mesh: &Mesh) -> Aabb {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn opaque_lod_depth_prepass_must_discard_the_same_pixels_as_forward() {
+        use bevy::pbr::MeshPipelineKey as Key;
+        let key = Key::DEPTH_PREPASS | Key::VISIBILITY_RANGE_DITHER;
+        let mut descriptor = RenderPipelineDescriptor::default();
+        descriptor.vertex.shader_defs =
+            vec!["PREPASS_PIPELINE".into(), "VISIBILITY_RANGE_DITHER".into()];
+        preserve_lod_depth_discard(&mut descriptor, key);
+        let fragment = descriptor
+            .fragment
+            .as_ref()
+            .expect("LOD depth writes must run the dither fragment");
+        assert_eq!(fragment.entry_point.as_deref(), Some("lod_depth_fragment"));
+        assert!(fragment.targets.is_empty());
+        assert_eq!(fragment.shader, descriptor.vertex.shader);
+        assert_eq!(fragment.shader_defs, descriptor.vertex.shader_defs);
+        for excluded in [
+            Key::NONE,
+            Key::DEPTH_PREPASS,
+            Key::VISIBILITY_RANGE_DITHER,
+            key | Key::UNCLIPPED_DEPTH_ORTHO,
+        ] {
+            let mut other = RenderPipelineDescriptor::default();
+            preserve_lod_depth_discard(&mut other, excluded);
+            assert!(other.fragment.is_none());
+        }
+        let original = descriptor.clone();
+        preserve_lod_depth_discard(&mut descriptor, key);
+        assert_eq!(
+            descriptor, original,
+            "depth discard specialization must be idempotent"
+        );
+    }
+    #[test]
+    fn alpha_mask_lod_depth_prepass_must_keep_alpha_and_dither_discard() {
+        use bevy::pbr::MeshPipelineKey as Key;
+        let key = Key::DEPTH_PREPASS | Key::VISIBILITY_RANGE_DITHER | Key::MAY_DISCARD;
+        let mut descriptor = RenderPipelineDescriptor::default();
+        descriptor.vertex.shader_defs = vec![
+            "PREPASS_PIPELINE".into(),
+            "VISIBILITY_RANGE_DITHER".into(),
+            "MAY_DISCARD".into(),
+        ];
+        descriptor.fragment = Some(bevy::render::render_resource::FragmentState {
+            entry_point: Some("fragment".into()),
+            targets: Vec::new(),
+            ..default()
+        });
+        preserve_lod_depth_discard(&mut descriptor, key);
+        assert_eq!(
+            descriptor.fragment.as_ref().unwrap().entry_point.as_deref(),
+            Some("lod_depth_fragment")
+        );
+        assert_eq!(
+            descriptor.fragment.as_ref().unwrap().shader_defs,
+            descriptor.vertex.shader_defs
+        );
+        for excluded in [
+            key | Key::NORMAL_PREPASS,
+            key | Key::MOTION_VECTOR_PREPASS,
+            key | Key::DEFERRED_PREPASS,
+            key | Key::UNCLIPPED_DEPTH_ORTHO,
+        ] {
+            let mut other = RenderPipelineDescriptor {
+                fragment: Some(bevy::render::render_resource::FragmentState {
+                    entry_point: Some("fragment".into()),
+                    ..default()
+                }),
+                ..default()
+            };
+            let original = other.clone();
+            preserve_lod_depth_discard(&mut other, excluded);
+            assert_eq!(other, original);
+        }
+    }
     #[test]
     fn diffuse_lighting_is_grass_only_and_pbr_comparison_remains_available() {
         let mut app = App::new();
