@@ -46,7 +46,7 @@ cargo run --locked -- --seed 42
 
 Click inside the window to control the horse. Close the window to quit.
 
-Streaming mode keeps up to 49 terrain chunks around the horse. Rivers widen downstream and flow into lakes; shallow fords have small stone markers on their banks. Dry sand and gravel are walkable, while deep water blocks movement. Tree detail changes per tree, and grass detail changes in 16m patches. Neighboring detail levels fade gradually, with geometry cached ahead of time. Grass, broadleaf leaves, and shrubs sway gently; conifers stay still. Vegetation shapes and shared textures are generated in Rust.
+Streaming mode keeps up to 49 terrain chunks around the horse. Adjacent east/west lake systems share a downhill connecting river when a safe route is found. A continuous dirt road connects the two lake shores when a safe walking route is found, using designated shallow fords for crossings. Short trails also mark dry banks and ford approaches. Rivers widen downstream and flow into lakes; shallow fords have small stone markers on their banks. Dry sand and gravel are walkable, while deep water blocks movement. Tree detail changes per tree, and grass detail changes in 16m patches. Neighboring detail levels fade gradually, with geometry cached ahead of time. Grass, broadleaf leaves, and shrubs sway gently; conifers stay still. Vegetation shapes and shared textures are generated in Rust.
 
 The resource dashboard shows CPU usage, process memory, frame rate and resident mesh estimates. Mesh estimates exclude ECS and GPU allocations; unavailable GPU measurements display `N/A`.
 
@@ -64,6 +64,8 @@ The resource dashboard shows CPU usage, process memory, frame rate and resident 
 | Return to the starting point | R |
 | Move to a riverbank | L |
 | Move to a ford entrance (streaming only) | G |
+| Move to a connecting-river bank (streaming only) | J |
+| Move to the lake-to-lake road (streaming only) | H |
 | Cycle exploration checkpoints (finite map only) | N |
 | Toggle resource dashboard | F3 |
 | Cycle natural / moisture / tree density / rockiness views | F4 |
@@ -120,6 +122,7 @@ src/main.rs                  Application setup and command-line options
 src/terrain.rs               Finite terrain and water boundaries
 src/streaming.rs              Seeded chunks, scheduling, installation and eviction
 src/watershed.rs              Shared river and lake drainage plans
+src/water_link.rs             Connections between lake systems and dirt trails
 src/environment.rs           Habitats and vegetation placement
 src/trees.rs                 Procedural tree shapes and detail levels
 src/grassfield.rs             Seeded meadow patches

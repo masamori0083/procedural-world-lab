@@ -8,7 +8,9 @@ use crate::{
 };
 use bevy::platform::time::Instant;
 use bevy::{
+    camera::{ImageRenderTarget, RenderTarget},
     prelude::*,
+    render::render_resource::TextureFormat,
     render::view::screenshot::{Screenshot, ScreenshotCaptured, save_to_disk},
     window::PrimaryWindow,
 };
@@ -30,6 +32,9 @@ pub struct StreamSmoke {
     headwater_source: Vec2,
     sand_start: Vec2,
     ford: Option<crate::watershed::Ford>,
+    trail_start: Vec2,
+    capture_image: Option<Handle<Image>>,
+    capture_failed: bool,
 }
 impl Default for StreamSmoke {
     fn default() -> Self {
@@ -50,8 +55,35 @@ impl Default for StreamSmoke {
             headwater_source: Vec2::ZERO,
             sand_start: Vec2::ZERO,
             ford: None,
+            trail_start: Vec2::ZERO,
+            capture_image: None,
+            capture_failed: false,
         }
     }
+}
+pub fn setup_capture(
+    mut commands: Commands,
+    mut smoke: ResMut<StreamSmoke>,
+    window: Single<&Window, With<PrimaryWindow>>,
+    camera: Single<Entity, With<crate::player::FollowCamera>>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    if smoke.capture_image.is_some() {
+        return;
+    }
+    let image = images.add(Image::new_target_texture(
+        window.physical_width(),
+        window.physical_height(),
+        TextureFormat::Rgba8UnormSrgb,
+        None,
+    ));
+    commands
+        .entity(*camera)
+        .insert(RenderTarget::Image(ImageRenderTarget {
+            handle: image.clone(),
+            scale_factor: window.scale_factor(),
+        }));
+    smoke.capture_image = Some(image);
 }
 #[allow(clippy::too_many_arguments)]
 pub fn drive(
@@ -62,6 +94,8 @@ pub fn drive(
     lab: Res<LabState>,
     world: Res<Meadow>,
     mut keys: ResMut<ButtonInput<KeyCode>>,
+    mut mouse: ResMut<bevy::input::mouse::AccumulatedMouseMotion>,
+    mut scroll: ResMut<bevy::input::mouse::AccumulatedMouseScroll>,
     mut rig: ResMut<CameraRig>,
     mut horse: Single<(&mut Transform, &mut HorseController)>,
     mut window: Single<&mut Window, With<PrimaryWindow>>,
@@ -73,12 +107,16 @@ pub fn drive(
         return;
     };
     assert!(
-        smoke.start.elapsed().as_secs() < 120,
+        smoke.start.elapsed().as_secs() < 240,
         "Streaming smoke timed out"
     );
     window.focused = true;
     rig.captured = true;
     keys.reset_all();
+    // Automated camera/route checks own their input. Real desktop motion must
+    // not turn a scripted ford crossing or move the following overview frame.
+    *mouse = default();
+    *scroll = default();
     if !smoke.fired {
         match smoke.stage {
             1 => {
@@ -209,7 +247,10 @@ pub fn drive(
                 assert!(smoke.ford.is_some(), "No ford available for crossing");
                 keys.press(KeyCode::KeyG);
             }
-            31 => keys.press(KeyCode::KeyB),
+            31 => {
+                horse.1.speed = 0.;
+                keys.press(KeyCode::KeyB);
+            }
             32 | 35 => {
                 let (p, yaw) = grass_field_view(&world, smoke.stage == 32);
                 horse.0.translation = Vec3::new(p.x, world.ground(p) + 0.025, p.y);
@@ -221,6 +262,38 @@ pub fn drive(
             }
             33 => keys.press(KeyCode::KeyV),
             34 => rig.frame_meadow_overview(),
+            36 => keys.press(KeyCode::KeyJ),
+            37 | 38 => keys.press(KeyCode::KeyB),
+            39..=42 => keys.press(KeyCode::F4),
+            43 => {
+                let g = world.stream_generator().unwrap();
+                let (p, yaw) = g
+                    .hydrology
+                    .road_view((0, 0))
+                    .expect("No walkable dirt trail");
+                smoke.trail_start = p;
+                horse.0.translation = Vec3::new(p.x, world.ground(p) + 0.025, p.y);
+                horse.1.speed = 0.;
+                horse.1.yaw = yaw;
+                horse.0.rotation = Quat::from_rotation_y(yaw);
+                *rig = CameraRig::default();
+                rig.captured = true;
+            }
+            45 | 47 | 49 => keys.press(KeyCode::KeyB),
+            46 | 48 => {
+                let g = world.stream_generator().unwrap();
+                let fraction = if smoke.stage == 46 { 0.5 } else { 1. };
+                let (p, yaw) = g
+                    .hydrology
+                    .road_stop((0, 0), fraction)
+                    .expect("No connected lake road");
+                horse.0.translation = Vec3::new(p.x, world.ground(p) + 0.025, p.y);
+                horse.1.speed = 0.;
+                horse.1.yaw = yaw;
+                horse.0.rotation = Quat::from_rotation_y(yaw);
+                *rig = CameraRig::default();
+                rig.captured = true;
+            }
             _ => {}
         }
         smoke.fired = true;
@@ -229,6 +302,14 @@ pub fn drive(
         keys.press(KeyCode::KeyW);
         if smoke.stage == 1 {
             keys.press(KeyCode::ShiftLeft);
+        }
+    }
+    if smoke.stage == 44 {
+        let p = Vec2::new(horse.0.translation.x, horse.0.translation.z);
+        if p.distance(smoke.trail_start) < 7. {
+            keys.press(KeyCode::KeyW);
+        } else {
+            horse.1.speed = 0.;
         }
     }
     if matches!(smoke.stage, 29 | 30) {
@@ -293,7 +374,13 @@ pub fn verify(
     config: Res<crate::vegetation::LodConfig>,
     terrain_config: Res<crate::terrain_lod::Config>,
     mut exit: MessageWriter<AppExit>,
+    camera_target: Single<&RenderTarget, With<crate::player::FollowCamera>>,
 ) {
+    if smoke.capture_failed {
+        eprintln!("INVALID STREAM SMOKE: captured image is black; visual validation rejected");
+        exit.write(AppExit::error());
+        return;
+    }
     if smoke.elapsed
         < if matches!(smoke.stage, 1 | 27) {
             2.0
@@ -304,6 +391,9 @@ pub fn verify(
         return;
     }
     let p = Vec2::new(horse.0.translation.x, horse.0.translation.z);
+    if smoke.stage == 44 && p.distance(smoke.trail_start) < 7. {
+        return;
+    }
     if matches!(smoke.stage, 29 | 30) {
         let ford = smoke.ford.unwrap();
         let target = if smoke.stage == 29 {
@@ -457,7 +547,15 @@ pub fn verify(
                 assert!((p - ford.center).dot(ford.across).abs() < 0.2);
             }
             if matches!(smoke.stage, 30 | 31) {
-                assert!((p - ford.center).dot(ford.across) >= ford.width + 15.);
+                assert!(
+                    (p - ford.center).dot(ford.across) >= ford.width + 15.,
+                    "Ford arrival changed during stage {}: {p:?}, across {}, target {}, speed {}, yaw {}",
+                    smoke.stage,
+                    (p - ford.center).dot(ford.across),
+                    ford.width + 15.,
+                    horse.1.speed,
+                    horse.1.yaw
+                );
                 assert!(world.stream_generator().unwrap().water_depth(p) < 0.);
             }
             if smoke.stage == 31 {
@@ -481,8 +579,39 @@ pub fn verify(
                 );
             }
         }
+        36..=42 => {
+            let g = world.stream_generator().unwrap();
+            let link = g.hydrology.link(crate::watershed::key(p)).unwrap();
+            assert!(link.bank_view(&g).unwrap().0.distance(p) < 1.);
+            assert!(g.water_depth(p) < 0.);
+            if smoke.stage == 37 {
+                assert_eq!(rig.mode, ViewMode::Overview);
+            }
+            if smoke.stage == 42 {
+                assert_eq!(*layer, MapLayer::Natural);
+            }
+        }
+        43..=45 => {
+            let g = world.stream_generator().unwrap();
+            assert!(g.hydrology.trail(p) > 0.9, "Horse left the dirt trail");
+            assert!(world.walkable(p));
+            if smoke.stage >= 44 {
+                assert!(
+                    p.distance(smoke.trail_start) > 6.5,
+                    "Horse stopped on the dirt trail"
+                );
+            }
+        }
+        46..=49 => {
+            let g = world.stream_generator().unwrap();
+            assert!(g.hydrology.trail(p) > 0.99 && world.walkable(p));
+            assert!(!stream.tree_blocks(p, None));
+            if smoke.stage >= 48 {
+                assert!(p.distance(g.hydrology.get((2, 0)).unwrap().lake) <= 48.);
+            }
+        }
         _ => {
-            if smoke.saved < 36 {
+            if smoke.saved < 50 {
                 return;
             }
             std::fs::create_dir_all("reports").expect("Cannot create smoke reports");
@@ -513,7 +642,7 @@ pub fn verify(
             std::fs::write(format!("reports/stream-smoke-seed-{}-{mode}.csv", world.seed),
                 format!("view,settled_frames,mean_frame_ms,max_frame_ms,resident_cpu_mib,vegetation_triangles,full_vegetation_triangles,tree_near,tree_middle,tree_far,grass_near,grass_middle,grass_far,lod_rebuilds,last_lod_worker_ms,last_lod_install_ms,terrain_near,terrain_middle,terrain_far,terrain_triangles,full_terrain_triangles,terrain_rebuilds,last_terrain_worker_ms,scheduler,queued,predicted_x,predicted_z,ground_wait_ms,max_ground_wait_ms,ground_wait_events,near_wait_ms,last_near_wait_ms,max_near_wait_ms,transition_frames,max_transition_frame_ms,grass_look,grass_shadow_chunks,grass_mesh_chunks,grass_shadow_candidate_triangles\n{}\n", smoke.report_rows.join("\n"))).expect("Cannot save smoke metrics");
             println!(
-                "STREAM SMOKE PASS: seam crossing, +/- distant coordinates, bounded 49 chunks / 2 tasks, asset eviction, deterministic revisit, cameras, map layers, shared rivers, bank view and mountain headwaters and calm lake, isolated landmark trees, vegetation LOD and FPS/follow switching, regional river connection, lake inlet, curved confluence, dry sand walking, water stop and walking across a shallow ford, tall grass meadow and calm open ground; 36 captures"
+                "STREAM SMOKE PASS: streaming, cameras, rivers, banks, fords, vegetation, paired-lake connection, connected lake road and trail walking; 50 captures"
             );
             exit.write(AppExit::Success);
             return;
@@ -556,6 +685,20 @@ pub fn verify(
         "grass-meadow-first-person",
         "grass-meadow-overview",
         "grass-open-ground",
+        "lake-link-bank",
+        "lake-link-overview",
+        "lake-link-return",
+        "lake-link-moisture",
+        "lake-link-forest",
+        "lake-link-rockiness",
+        "lake-link-natural",
+        "dirt-trail-start",
+        "dirt-trail-walk",
+        "dirt-trail-overview",
+        "lake-road-middle",
+        "lake-road-middle-overview",
+        "lake-road-arrival",
+        "lake-road-arrival-overview",
     ][smoke.stage];
     let (actual, full) = stream.vegetation_vertices();
     let (t, g) = stream.lod_counts();
@@ -618,12 +761,20 @@ pub fn verify(
     smoke.transition_frames_ms.clear();
     smoke.transition_done = false;
     commands
-        .spawn(Screenshot::primary_window())
+        .spawn(Screenshot((*camera_target).clone()))
         .observe(save_to_disk(format!(
             "captures/stream-seed-{}/{name}.png",
             world.seed
         )))
-        .observe(|_: On<ScreenshotCaptured>, mut smoke: ResMut<StreamSmoke>| smoke.saved += 1);
+        .observe(
+            |capture: On<ScreenshotCaptured>, mut smoke: ResMut<StreamSmoke>| {
+                let valid = capture.image.data.as_deref().is_some_and(|data| {
+                    data.chunks_exact(4).any(|p| p[..3].iter().any(|v| *v != 0))
+                });
+                smoke.capture_failed |= !valid;
+                smoke.saved += 1;
+            },
+        );
     smoke.stage += 1;
     smoke.elapsed = 0.;
     smoke.fired = false;

@@ -233,6 +233,27 @@ pub fn controls(
             rig.snap = true;
         }
     }
+    if (keys.just_pressed(KeyCode::KeyJ) || keys.just_pressed(KeyCode::KeyH))
+        && lab.ready
+        && let Some(g) = world.stream_generator()
+    {
+        let from = Vec2::new(transform.translation.x, transform.translation.z);
+        let target = if keys.just_pressed(KeyCode::KeyH) {
+            g.hydrology.road_view(crate::watershed::key(from))
+        } else {
+            g.hydrology
+                .link(crate::watershed::key(from))
+                .and_then(|l| l.bank_view(&g))
+        };
+        if let Some((p, yaw)) = target {
+            transform.translation = Vec3::new(p.x, world.ground(p) + 0.025, p.y);
+            horse.speed = 0.;
+            horse.yaw = yaw;
+            transform.rotation = Quat::from_rotation_y(yaw);
+            rig.mode = ViewMode::ThirdPerson;
+            rig.snap = true;
+        }
+    }
     if keys.just_pressed(KeyCode::KeyL) && lab.ready {
         let bank = if let Some(s) = &stream {
             s.river_bank(
@@ -485,7 +506,7 @@ pub fn update_hud(
         let terrain_lod = stream.terrain_lod_counts();
         let (terrain_triangles, full_terrain_triangles) = stream.terrain_triangles();
         hud.0 = format!(
-            "MAP GENERATION LAB | STREAMING v{} | {view} | {status}\nSeed {}   Position {:.0}, {:.0} m   {}\nChunks {} / {}   Pending {} / 2   Generated {}   Evicted {}\nResident mesh + LOD data {:.1} MiB (CPU estimate)   Trees {}\nTree LOD N/M/F {}/{}/{}   Grass {}/{}/{}\nVegetation triangles {} / {} full   Rebuilds {} ({:.1} ms)\nTerrain LOD N/M/F {}/{}/{}   Triangles {} / {} full\nTerrain rebuilds {} ({:.1} ms)\nScheduler {}   Queued {}   Ahead {:.0}, {:.0} m\nGround wait total/max {:.1}/{:.1} ms   Stops {}\nFoot detail last/max {:.1}/{:.1} ms   Waiting {:.1} ms\nWatersheds {}   River sources {}   Water triangles {}\nLast chunk worker {:.1} ms   Install {:.2} ms\nW/S Move   A/D + Mouse Turn   Shift Run   V FPS / Follow\nB Overview   Wheel Zoom   Esc Pause   R Start   L River bank   G Ford\nF3 Resources   F4 Map layers\n{}",
+            "MAP GENERATION LAB | STREAMING v{} | {view} | {status}\nSeed {}   Position {:.0}, {:.0} m   {}\nChunks {} / {}   Pending {} / 2   Generated {}   Evicted {}\nResident mesh + LOD data {:.1} MiB (CPU estimate)   Trees {}\nTree LOD N/M/F {}/{}/{}   Grass {}/{}/{}\nVegetation triangles {} / {} full   Rebuilds {} ({:.1} ms)\nTerrain LOD N/M/F {}/{}/{}   Triangles {} / {} full\nTerrain rebuilds {} ({:.1} ms)\nScheduler {}   Queued {}   Ahead {:.0}, {:.0} m\nGround wait total/max {:.1}/{:.1} ms   Stops {}\nFoot detail last/max {:.1}/{:.1} ms   Waiting {:.1} ms\nWatersheds {}   River sources {}   Water triangles {}\nLast chunk worker {:.1} ms   Install {:.2} ms\nW/S Move   A/D + Mouse Turn   Shift Run   V FPS / Follow\nB Overview   Wheel Zoom   Esc Pause   R Start   L River bank   G Ford   J Connecting river   H Lake road\nF3 Resources   F4 Map layers\n{}",
             crate::streaming::VERSION,
             world.seed,
             position.translation.x,
@@ -634,6 +655,35 @@ mod tests {
             }
             app.update();
         }
+    }
+
+    #[test]
+    fn lake_road_shortcut_lands_on_the_connected_route() {
+        let g = crate::streaming::Generator::new(42, crate::terrain::TerrainSettings::default());
+        let (target, _) = g.hydrology.road_view((0, 0)).unwrap();
+        let (mut app, horse) = scene_with(Meadow::from_stream_generator(g.clone()));
+        frames(&mut app, 1, &[KeyCode::KeyH]);
+        let t = app.world().get::<Transform>(horse).unwrap();
+        let p = Vec2::new(t.translation.x, t.translation.z);
+        assert!(p.distance(target) < 0.01);
+        assert!(app.world().resource::<Meadow>().walkable(p));
+        assert!(g.hydrology.trail(p) > 0.99);
+    }
+    #[test]
+    fn connecting_river_shortcut_lands_on_a_dry_bank() {
+        let g = crate::streaming::Generator::new(42, crate::terrain::TerrainSettings::default());
+        let (target, _) = g.hydrology.link((0, 0)).unwrap().bank_view(&g).unwrap();
+        let map = Meadow::from_stream_generator(g.clone());
+        let (mut app, horse) = scene_with(map);
+        frames(&mut app, 1, &[KeyCode::KeyJ]);
+        let t = app.world().get::<Transform>(horse).unwrap();
+        let p = Vec2::new(t.translation.x, t.translation.z);
+        assert!(p.distance(target) < 0.01);
+        assert!(g.water_depth(p) < -0.015);
+        assert_eq!(
+            app.world().resource::<CameraRig>().mode,
+            ViewMode::ThirdPerson
+        );
     }
 
     #[derive(Resource, Default)]

@@ -14,6 +14,7 @@ mod terrain_lod;
 mod trees;
 mod vegetation;
 mod water;
+mod water_link;
 mod watershed;
 #[cfg(target_arch = "wasm32")]
 mod web;
@@ -103,6 +104,9 @@ fn main() {
         terrain::Meadow::new(seed)
     };
     meadow.set_grass_look(refined_grass);
+    // Web plans are prepared by yielding chunk jobs. Resident chunk obstacles
+    // supply collision; sampling trees before planning would leave ghost trunks.
+    #[cfg(not(target_arch = "wasm32"))]
     if let Some(generator) = meadow.stream_generator() {
         meadow.trees = [
             streaming::ChunkKey(-1, -1),
@@ -276,6 +280,12 @@ fn main() {
         std::fs::create_dir_all(format!("captures/stream-seed-{seed}"))
             .expect("Cannot create captures directory");
         app.init_resource::<stream_smoke::StreamSmoke>()
+            .add_systems(
+                Update,
+                stream_smoke::setup_capture
+                    .after(player::follow_camera)
+                    .before(streaming::schedule),
+            )
             .add_systems(Update, stream_smoke::verify.after(player::update_hud));
     }
     if smoke_test && !stream_mode {

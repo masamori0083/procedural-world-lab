@@ -22,7 +22,7 @@ use std::{
     sync::Arc,
 };
 
-pub const VERSION: u32 = 19;
+pub const VERSION: u32 = 20;
 pub const CHUNK_SIZE: f32 = 96.0;
 #[cfg(not(target_arch = "wasm32"))]
 pub const RADIUS: i32 = 3;
@@ -167,6 +167,21 @@ pub struct Generator {
     pub hydrology: Arc<crate::watershed::Cache>,
     pub refined_grass: bool,
 }
+/// Interpolate the collision grid using the same triangles as the rendered mesh.
+pub(crate) fn triangle_ground(p: Vec2, height: &impl Fn(Vec2) -> f32) -> f32 {
+    let cell = (p / CELL).floor() * CELL;
+    let f = (p - cell) / CELL;
+    let a = height(cell);
+    let b = height(cell + Vec2::X * CELL);
+    let c = height(cell + Vec2::Y * CELL);
+    let d = height(cell + Vec2::splat(CELL));
+    if f.x + f.y <= 1. {
+        a + (b - a) * f.x + (c - a) * f.y
+    } else {
+        d + (c - d) * (1. - f.x) + (b - d) * (1. - f.y)
+    }
+}
+
 impl Generator {
     pub fn new(seed: u32, settings: TerrainSettings) -> Self {
         let g = Self {
@@ -175,7 +190,10 @@ impl Generator {
             hydrology: Arc::default(),
             refined_grass: true,
         };
-        // One coarse spawn-region plan; distant plans run in chunk workers.
+        // Native tools need the initial plan synchronously. In the browser the
+        // complete paired plan runs in the existing yielding chunk job instead
+        // of blocking WASM startup. The protected spawn clearing stays dry.
+        #[cfg(not(target_arch = "wasm32"))]
         g.hydrology.prepare(&g, crate::watershed::key(Vec2::ZERO));
         g
     }
@@ -239,17 +257,7 @@ impl Generator {
         self.hydrology.ford_height(p, height, field)
     }
     pub fn ground(&self, p: Vec2) -> f32 {
-        let cell = (p / CELL).floor() * CELL;
-        let f = (p - cell) / CELL;
-        let a = self.height(cell);
-        let b = self.height(cell + Vec2::X * CELL);
-        let c = self.height(cell + Vec2::Y * CELL);
-        let d = self.height(cell + Vec2::splat(CELL));
-        if f.x + f.y <= 1. {
-            a + (b - a) * f.x + (c - a) * f.y
-        } else {
-            d + (c - d) * (1. - f.x) + (b - d) * (1. - f.y)
-        }
+        triangle_ground(p, &|q| self.height(q))
     }
     /// Water depth on the SAME triangle plane clipped by water_meshes.
     /// Analytic field levels can differ at a bend or river/lake junction.
@@ -334,12 +342,17 @@ impl Generator {
             sample.tree_density = 0.;
         }
         sample.grass_density *= 1. - 0.7 * self.hydrology.ford_strength(p);
+        let trail = self.hydrology.trail(p);
+        if self.hydrology.trail_tree_clearance(p) > 0. {
+            sample.tree_density = 0.;
+        }
+        sample.grass_density *= 1. - trail;
+        sample.rockiness *= 1. - trail;
         sample
     }
     pub fn nearest_ford(&self, p: Vec2) -> Option<crate::watershed::Ford> {
         self.hydrology
-            .get(crate::watershed::key(p))?
-            .fords
+            .fords(crate::watershed::key(p))
             .iter()
             .copied()
             .min_by(|a, b| {
@@ -348,6 +361,7 @@ impl Generator {
                     .total_cmp(&b.center.distance_squared(p))
             })
     }
+    #[cfg(any(not(target_arch = "wasm32"), test))]
     pub fn trees(&self, key: ChunkKey) -> Vec<(Vec2, f32)> {
         self.tree_candidates(key, 0)
     }
@@ -417,13 +431,23 @@ struct TreeObstacle {
 pub struct ChunkSurface {
     samples: Vec<EnvironmentSample>,
     patches: Vec<f32>,
+    trails: Vec<f32>,
 }
 impl ChunkSurface {
     pub fn colors(&self, layer: MapLayer) -> Vec<[f32; 4]> {
         self.samples
             .iter()
             .zip(&self.patches)
-            .map(|(s, p)| s.color(layer, *p))
+            .zip(&self.trails)
+            .map(|((s, p), trail)| {
+                let mut color = s.color(layer, *p);
+                if layer == MapLayer::Natural {
+                    for (value, dirt) in color[..3].iter_mut().zip([0.43, 0.31, 0.19]) {
+                        *value += (dirt - *value) * trail;
+                    }
+                }
+                color
+            })
             .collect()
     }
 }
@@ -740,6 +764,7 @@ fn simplify_surface(
             let p = key.origin() + Vec2::new(p[0], p[2]);
             let water = g.water(p);
             water.distance <= water.width + 12.
+                || g.hydrology.trail(p) > 0.
                 || trees
                     .iter()
                     .any(|(tree, _)| (p - *tree).abs().max_element() <= CELL)
@@ -768,8 +793,15 @@ fn simplify_surface(
     let colors = ChunkSurface {
         samples: selected.iter().map(|i| samples[*i]).collect(),
         patches: selected.iter().map(|i| patches[*i]).collect(),
+        trails: selected
+            .iter()
+            .map(|i| {
+                g.hydrology
+                    .trail(key.origin() + Vec2::new(positions[*i][0], positions[*i][2]))
+            })
+            .collect(),
     };
-    let bytes = selected.len() * (40 + size_of::<EnvironmentSample>() + size_of::<f32>())
+    let bytes = selected.len() * (40 + size_of::<EnvironmentSample>() + 2 * size_of::<f32>())
         + indices.len() * 4;
     let mesh = Mesh::new(
         PrimitiveTopology::TriangleList,
@@ -858,12 +890,10 @@ struct FordStone {
 fn ford_stones(g: &Generator, key: ChunkKey) -> Vec<FordStone> {
     let mut stones = Vec::new();
     let origin = key.origin();
-    let Some(plan) = g.hydrology.get(crate::watershed::key(
+    let fords = g.hydrology.fords(crate::watershed::key(
         origin + Vec2::splat(CHUNK_SIZE * 0.5),
-    )) else {
-        return stones;
-    };
-    for ford in &plan.fords {
+    ));
+    for ford in &fords {
         if ford.center.x < origin.x - 30.
             || ford.center.y < origin.y - 30.
             || ford.center.x > origin.x + CHUNK_SIZE + 30.
@@ -883,27 +913,34 @@ fn ford_stones(g: &Generator, key: ChunkKey) -> Vec<FordStone> {
                     let height = random.range(0.35, 0.60);
                     let yaw = random.range(0., std::f32::consts::TAU);
                     let shade = random.range(0.38, 0.52);
-                    // Find the actual dry shoreline, not the nominal river width.
-                    let Some(distance) = (0..80).map(|i| 1. + i as f32 * 0.25).find(|d| {
-                        let p = ford.center + along * lateral + ford.across * bank * *d;
-                        g.water_depth(p) < -0.08
-                    }) else {
+                    let radius = radii.max_element();
+                    // Retain marker groups on both banks, but move a stone
+                    // sideways if a new lake road passes through its footprint.
+                    let candidate = (0..=8).find_map(|shift| {
+                        let lateral = lateral + edge * shift as f32;
+                        let distance = (0..80).map(|i| 1. + i as f32 * 0.25).find(|d| {
+                            let p = ford.center + along * lateral + ford.across * bank * *d;
+                            g.water_depth(p) < -0.08
+                        })?;
+                        let p = ford.center
+                            + along * lateral
+                            + ford.across * bank * (distance + setback);
+                        if g.hydrology.trail_blocks_marker(p, radius) {
+                            return None;
+                        }
+                        let mut base = g.ground(p);
+                        let dry = (0..8).all(|i| {
+                            let q = p + Vec2::from_angle(i as f32 * std::f32::consts::TAU / 8.)
+                                * radius;
+                            base = base.min(g.ground(q));
+                            g.water_depth(q) < -0.015
+                        });
+                        (dry && base - 0.06 + height > g.ground(p)).then_some((p, base))
+                    });
+                    let Some((p, base)) = candidate else {
                         continue;
                     };
-                    let p =
-                        ford.center + along * lateral + ford.across * bank * (distance + setback);
                     if ChunkKey::at(p) != key {
-                        continue;
-                    }
-                    let radius = radii.max_element();
-                    let mut base = g.ground(p);
-                    let dry = (0..8).all(|i| {
-                        let q =
-                            p + Vec2::from_angle(i as f32 * std::f32::consts::TAU / 8.) * radius;
-                        base = base.min(g.ground(q));
-                        g.water_depth(q) < -0.015
-                    });
-                    if !dry {
                         continue;
                     }
                     stones.push(FordStone {
@@ -2491,7 +2528,7 @@ pub fn generation_report(generator: Generator, settings: TreeSettings) {
             triangles += built.mesh.indices().unwrap().len() / 3;
         }
         let mesh_bytes = vertices * 40 + triangles * 3 * 4;
-        let color_bytes = vertices * (size_of::<EnvironmentSample>() + size_of::<f32>());
+        let color_bytes = vertices * (size_of::<EnvironmentSample>() + 2 * size_of::<f32>());
         terrain_csv.push_str(&format!(
             "{detail:?},9,{vertices},{triangles},{:.3},{:.3},{:.3}\n",
             mesh_bytes as f64 / (1024. * 1024.),
@@ -2834,6 +2871,16 @@ mod tests {
                         "Duplicate chunk marker"
                     );
                     assert!(g.water_depth(p) < -0.015);
+                    for edge in g.hydrology.lake_road((0, 0)).windows(2) {
+                        let t = ((p - edge[0]).dot(edge[1] - edge[0])
+                            / edge[0].distance_squared(edge[1]))
+                        .clamp(0., 1.);
+                        assert!(
+                            p.distance(edge[0].lerp(edge[1], t))
+                                > 1.25 + stone.radii.max_element() + 0.35,
+                            "Stone intersects lake road at {p:?}"
+                        );
+                    }
                     assert!(
                         (p - ford.center).perp_dot(ford.across).abs() - stone.radii.max_element()
                             > 2.
@@ -3736,12 +3783,27 @@ mod tests {
             for owner in [(0, 0), (-2, -2), (2, -2)] {
                 g.hydrology.prepare(&g, owner);
                 let plan = g.hydrology.get(owner).unwrap();
-                let samples: Vec<_> = plan
+                let mut samples: Vec<_> = plan
                     .segments
                     .iter()
                     .filter(|s| s.b.p.distance(plan.lake) <= crate::watershed::LAKE_RADIUS + 24.)
                     .flat_map(|s| (0..=64).map(move |i| s.a.p.lerp(s.b.p, i as f32 / 64.)))
                     .collect();
+                if let Some(link) = g.hydrology.link(owner) {
+                    let seam = crate::watershed::origin(crate::watershed::pair(owner)).x
+                        + crate::watershed::SIZE * 2.;
+                    samples.extend(
+                        link.plan
+                            .segments
+                            .iter()
+                            .filter(|s| {
+                                s.a.p.distance(link.upstream) < 60.
+                                    || s.b.p.distance(link.downstream) < 60.
+                                    || (s.a.p.x - seam) * (s.b.p.x - seam) <= 0.
+                            })
+                            .flat_map(|s| (0..=32).map(move |i| s.a.p.lerp(s.b.p, i as f32 / 32.))),
+                    );
+                }
                 let keys: BTreeSet<_> = samples.iter().copied().map(ChunkKey::at).collect();
                 let mut triangles = Vec::new();
                 for key in keys {

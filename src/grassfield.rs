@@ -173,6 +173,7 @@ pub async fn generate_incremental(
                 if chance > probability
                     || sample.slope > 0.65
                     || sample.grass_density <= 0.
+                    || g.hydrology.trail(p) >= 0.99
                     || sample.water_distance < 2.
                     || g.water_depth(p) >= -0.015
                 {
@@ -203,6 +204,34 @@ pub async fn generate_incremental(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn generated_tuft_roots_leave_dirt_road_core_clear() {
+        let g = Generator::new(42, crate::terrain::TerrainSettings::default());
+        let key = ChunkKey(2, 7);
+        let mut positions = Vec::new();
+        let mut samples = Vec::new();
+        for z in 0..=(CHUNK_SIZE / CELL) as usize {
+            for x in 0..=(CHUNK_SIZE / CELL) as usize {
+                let q = Vec2::new(x as f32, z as f32) * CELL;
+                let p = key.origin() + q;
+                positions.push([q.x, g.height(p), q.y]);
+                samples.push(g.habitat(p));
+            }
+        }
+        let blades = bevy::tasks::block_on(generate_incremental(
+            &g,
+            key,
+            &Fields::new(g.seed, key.origin()),
+            &positions,
+            &samples,
+            &mut crate::work_budget::WorkBudget::unlimited(),
+        ));
+        assert!(!blades.is_empty());
+        for blade in blades {
+            let p = key.origin() + Vec2::new(blade.c.x, blade.c.z);
+            assert!(g.hydrology.trail(p) < 0.99, "Grass on road at {p:?}");
+        }
+    }
     #[test]
     fn field_edges_are_seeded_continuous_and_leave_open_land() {
         for seed in [42, 20261003, 314159] {

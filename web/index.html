@@ -16,7 +16,7 @@
       <canvas id="map-canvas" tabindex="0" aria-label="Procedural 3D map. Click to explore; Escape releases the mouse."></canvas>
       <section id="loading">
         <h2>A world grown from a seed</h2>
-        <p>Explore rivers, hills and forests. Trees and grass are generated in Rust; animated animals roam the map.</p>
+        <p>Explore rivers, lake roads, hills and forests. Trees and grass are generated in Rust; animated animals roam the map.</p>
         <button id="start" type="button">Explore</button>
         <p id="load-detail" aria-live="polite">Requires a desktop browser with WebGPU.</p>
       </section>
@@ -24,7 +24,7 @@
     <p id="status" role="status">Choose a seed and start exploring.</p>
     <details open><summary>Controls &amp; demo details</summary>
       <p><strong>W / S</strong> Move &nbsp; <strong>A / D + mouse</strong> Turn &nbsp; <strong>Shift</strong> Run &nbsp; <strong>V</strong> First person / follow &nbsp; <strong>B</strong> Overview &nbsp; <strong>Wheel</strong> Zoom &nbsp; <strong>Esc</strong> Release mouse</p>
-      <p><strong>R</strong> Return to start &nbsp; <strong>L</strong> River bank &nbsp; <strong>G</strong> Ford &nbsp; <strong>F3</strong> Resource panel &nbsp; <strong>F4</strong> Map layers</p>
+      <p><strong>R</strong> Return to start &nbsp; <strong>L</strong> River bank &nbsp; <strong>G</strong> Ford &nbsp; <strong>J</strong> Connecting river &nbsp; <strong>H</strong> Lake road &nbsp; <strong>F3</strong> Resource panel &nbsp; <strong>F4</strong> Map layers</p>
       <p>This browser demo keeps nine chunks nearby and uses the same animated animal models as the desktop app. Generation runs in small batches; the 3D view is capped at 1280×720, with a sharp HUD. Frame p95 covers the last two seconds; generation slice is the longest work interval since the previous status update. These elapsed times are not GPU timings. CPU usage, process memory and GPU usage are unavailable in the browser.</p>
     </details>
   </main>

@@ -1,6 +1,6 @@
 //! Shared inland drainage plans, independent of render chunk order.
 //! Four 768 m regions share one drainage graph and terminal lake.
-//! The 1536 m planning footprint is bounded; separate lake systems stay independent.
+//! Adjacent east/west systems are planned and published as one bounded pair.
 use crate::{river::RiverField, streaming::Generator};
 use bevy::prelude::*;
 use std::{
@@ -23,7 +23,7 @@ pub fn key(p: Vec2) -> Key {
     let q = ((p + Vec2::splat(SIZE * 0.5)) / SIZE).floor().as_ivec2();
     (q.x, q.y)
 }
-fn origin(k: Key) -> Vec2 {
+pub(crate) fn origin(k: Key) -> Vec2 {
     Vec2::new(k.0 as f32, k.1 as f32) * SIZE - Vec2::splat(SIZE * 0.5)
 }
 /// Canonical owner of a 2x2 group. Euclidean division also groups negative keys.
@@ -31,8 +31,17 @@ pub fn system(k: Key) -> Key {
     (k.0.div_euclid(2) * 2, k.1.div_euclid(2) * 2)
 }
 
+pub fn pair(k: Key) -> Key {
+    let k = system(k);
+    (k.0.div_euclid(4) * 4, k.1)
+}
+struct Pair {
+    plans: [Arc<Plan>; 2],
+    link: Option<Arc<crate::water_link::Link>>,
+    trails: crate::water_link::Trails,
+}
 #[derive(Default)]
-pub struct Cache(RwLock<BTreeMap<Key, Arc<Plan>>>);
+pub struct Cache(RwLock<BTreeMap<Key, Arc<Pair>>>);
 impl Cache {
     pub fn prepare(&self, g: &Generator, k: Key) {
         bevy::tasks::block_on(self.prepare_incremental(
@@ -47,62 +56,186 @@ impl Cache {
         k: Key,
         budget: &mut crate::work_budget::WorkBudget,
     ) {
-        let k = system(k);
+        let k = pair(k);
         if self.0.read().unwrap().contains_key(&k) {
             return;
         }
         // Never retain a cache lock across a browser yield. Publish a complete
         // plan atomically, so terrain/collision cannot observe half a river.
-        let plan = Arc::new(Plan::generate_incremental(g, k, budget).await);
+        let plans = [
+            Arc::new(Plan::generate_incremental(g, k, budget).await),
+            Arc::new(Plan::generate_incremental(g, (k.0 + 2, k.1), budget).await),
+        ];
+        let link = crate::water_link::Link::generate_incremental(g, k, &plans, budget)
+            .await
+            .map(Arc::new);
+        let trails =
+            crate::water_link::Trails::generate_incremental(g, &plans, link.as_deref(), budget)
+                .await;
+        let plan = Arc::new(Pair {
+            plans,
+            link,
+            trails,
+        });
         self.0.write().unwrap().entry(k).or_insert(plan);
     }
     pub fn get(&self, k: Key) -> Option<Arc<Plan>> {
-        self.0.read().unwrap().get(&system(k)).cloned()
+        self.0
+            .read()
+            .unwrap()
+            .get(&pair(k))
+            .map(|p| p.plans[usize::from(system(k).0 != pair(k).0)].clone())
+    }
+    pub fn link(&self, k: Key) -> Option<Arc<crate::water_link::Link>> {
+        self.0
+            .read()
+            .unwrap()
+            .get(&pair(k))
+            .and_then(|p| p.link.clone())
+    }
+    pub fn trail(&self, p: Vec2) -> f32 {
+        self.0
+            .read()
+            .unwrap()
+            .get(&pair(key(p)))
+            .map_or(0., |v| v.trails.strength(p))
+    }
+    pub fn trail_blocks_marker(&self, p: Vec2, radius: f32) -> bool {
+        self.0
+            .read()
+            .unwrap()
+            .get(&pair(key(p)))
+            .is_some_and(|v| v.trails.blocks_marker(p, radius))
+    }
+    pub fn trail_tree_clearance(&self, p: Vec2) -> f32 {
+        self.0
+            .read()
+            .unwrap()
+            .get(&pair(key(p)))
+            .map_or(0., |v| v.trails.tree_clearance(p))
+    }
+    pub fn road_view(&self, k: Key) -> Option<(Vec2, f32)> {
+        self.0
+            .read()
+            .unwrap()
+            .get(&pair(k))
+            .and_then(|p| p.trails.road_view())
+    }
+    pub fn road_stop(&self, k: Key, fraction: f32) -> Option<(Vec2, f32)> {
+        self.0
+            .read()
+            .unwrap()
+            .get(&pair(k))
+            .and_then(|p| p.trails.road_stop(fraction))
+    }
+    #[cfg(test)]
+    pub fn lake_road(&self, k: Key) -> Vec<Vec2> {
+        self.0
+            .read()
+            .unwrap()
+            .get(&pair(k))
+            .map_or_else(Vec::new, |p| p.trails.lake_road().to_vec())
+    }
+    #[cfg(test)]
+    pub(crate) fn trail_segments(&self) -> Vec<(Vec2, Vec2)> {
+        self.0
+            .read()
+            .unwrap()
+            .values()
+            .flat_map(|p| p.trails.segments.iter().copied())
+            .collect()
     }
     pub fn retain(&self, keep: &BTreeSet<Key>) {
-        let keep: BTreeSet<_> = keep.iter().copied().map(system).collect();
+        let keep: BTreeSet<_> = keep.iter().copied().map(pair).collect();
         self.0.write().unwrap().retain(|k, _| keep.contains(k));
     }
     pub fn source_count(&self) -> usize {
-        self.0.read().unwrap().values().map(|p| p.sources).sum()
+        self.0
+            .read()
+            .unwrap()
+            .values()
+            .flat_map(|p| &p.plans)
+            .map(|p| p.sources)
+            .sum()
     }
     pub fn len(&self) -> usize {
-        self.0.read().unwrap().len()
+        self.0.read().unwrap().len() * 2
     }
     pub fn ford_strength(&self, p: Vec2) -> f32 {
-        self.get(key(p)).map_or(0., |plan| plan.ford_strength(p))
+        let entries = self.0.read().unwrap();
+        let k = key(p);
+        let Some(entry) = entries.get(&pair(k)) else {
+            return 0.;
+        };
+        let base = entry.plans[usize::from(system(k).0 != pair(k).0)].ford_strength(p);
+        base.max(entry.link.as_ref().map_or(0., |l| l.plan.ford_strength(p)))
     }
     pub fn ford_route(&self, p: Vec2) -> bool {
-        self.get(key(p)).is_some_and(|plan| {
-            plan.fords.iter().any(|f| {
+        let entries = self.0.read().unwrap();
+        let k = key(p);
+        let Some(entry) = entries.get(&pair(k)) else {
+            return false;
+        };
+        entry.plans[usize::from(system(k).0 != pair(k).0)]
+            .fords
+            .iter()
+            .chain(entry.link.iter().flat_map(|l| l.plan.fords.iter()))
+            .any(|f| {
                 let offset = p - f.center;
                 offset.perp_dot(f.across).abs() < 5.5 && offset.dot(f.across).abs() < f.width + 30.
             })
-        })
+    }
+    pub fn fords(&self, k: Key) -> Vec<Ford> {
+        let mut result = self.get(k).map_or_else(Vec::new, |p| p.fords.clone());
+        if let Some(link) = self.link(k) {
+            result.extend(link.plan.fords.iter().copied());
+        }
+        result
     }
     pub fn ford_height(&self, p: Vec2, ground: f32, field: RiverField) -> f32 {
-        self.get(key(p))
-            .map_or(ground, |plan| plan.ford_height(p, ground, field))
+        let entries = self.0.read().unwrap();
+        let k = key(p);
+        let Some(entry) = entries.get(&pair(k)) else {
+            return ground;
+        };
+        let ground =
+            entry.plans[usize::from(system(k).0 != pair(k).0)].ford_height(p, ground, field);
+        entry
+            .link
+            .as_ref()
+            .map_or(ground, |l| l.plan.ford_height(p, ground, field))
     }
     pub fn field(&self, p: Vec2) -> RiverField {
         let k = system(key(p));
         let local = p - origin(k);
         // Only the OUTER system perimeter is dry. Rivers cross the internal
         // 768 m boundaries using the exact same graph, independent of loading.
-        if local.min_element() < 8. || local.max_element() > SPAN - 8. {
+        let entries = self.0.read().unwrap();
+        let Some(entry) = entries.get(&pair(k)) else {
             return dry();
-        }
-        self.0
-            .read()
-            .unwrap()
-            .get(&k)
-            .map_or_else(dry, |plan| plan.field(p))
+        };
+        let base = if local.min_element() < 8. || local.max_element() > SPAN - 8. {
+            dry()
+        } else {
+            entry.plans[usize::from(k.0 != pair(k).0)].field(p)
+        };
+        entry
+            .link
+            .as_ref()
+            .map_or(base, |link| closest(base, link.field(p)))
     }
 }
 fn dry() -> RiverField {
     RiverField {
         distance: 1_000_000.,
         ..default()
+    }
+}
+pub(crate) fn closest(a: RiverField, b: RiverField) -> RiverField {
+    if b.distance - wet_radius(b.width) < a.distance - wet_radius(a.width) {
+        b
+    } else {
+        a
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -143,6 +276,7 @@ pub struct Plan {
     pub fords: Vec<Ford>,
     origin: Vec2,
     bins: Vec<Vec<usize>>,
+    bin_size: UVec2,
 }
 #[derive(Clone, Copy)]
 struct Cell {
@@ -386,26 +520,52 @@ impl Plan {
             fords: Vec::new(),
             origin,
             bins: vec![vec![]; BIN_SIDE * BIN_SIDE],
+            bin_size: UVec2::splat(BIN_SIDE as u32),
         };
-        for (i, s) in plan.segments.iter().enumerate() {
+        plan.index_incremental(budget).await;
+        plan.place_fords_incremental(g, k, budget).await;
+        plan
+    }
+    pub(crate) async fn channel_incremental(
+        g: &Generator,
+        owner: Key,
+        segments: Vec<Segment>,
+        lake: Vec2,
+        budget: &mut crate::work_budget::WorkBudget,
+    ) -> Self {
+        let lake_level = segments.last().unwrap().b.level;
+        let mut plan = Self {
+            segments,
+            lake,
+            lake_level,
+            sources: 1,
+            fords: Vec::new(),
+            origin: origin(owner),
+            bins: vec![vec![]; BIN_SIDE * BIN_SIDE * 2],
+            bin_size: UVec2::new((BIN_SIDE * 2) as u32, BIN_SIDE as u32),
+        };
+        plan.index_incremental(budget).await;
+        plan.place_fords_incremental(g, owner, budget).await;
+        plan
+    }
+    async fn index_incremental(&mut self, budget: &mut crate::work_budget::WorkBudget) {
+        for (i, s) in self.segments.iter().enumerate() {
             budget.checkpoint().await;
             let padding = Vec2::splat(INFLUENCE + s.a.width.max(s.b.width) + 4.);
-            let lo = ((s.a.p.min(s.b.p) - origin - padding) / BIN)
+            let lo = ((s.a.p.min(s.b.p) - self.origin - padding) / BIN)
                 .floor()
                 .as_ivec2()
                 .max(IVec2::ZERO);
-            let hi = ((s.a.p.max(s.b.p) - origin + padding) / BIN)
+            let hi = ((s.a.p.max(s.b.p) - self.origin + padding) / BIN)
                 .floor()
                 .as_ivec2()
-                .min(IVec2::splat(BIN_SIDE as i32 - 1));
+                .min(self.bin_size.as_ivec2() - IVec2::ONE);
             for z in lo.y..=hi.y {
                 for x in lo.x..=hi.x {
-                    plan.bins[z as usize * BIN_SIDE + x as usize].push(i);
+                    self.bins[z as usize * self.bin_size.x as usize + x as usize].push(i);
                 }
             }
         }
-        plan.place_fords_incremental(g, k, budget).await;
-        plan
     }
     pub fn ford_strength(&self, p: Vec2) -> f32 {
         self.fords
@@ -611,10 +771,10 @@ impl Plan {
         let bin = ((p - self.origin) / BIN)
             .floor()
             .as_ivec2()
-            .clamp(IVec2::ZERO, IVec2::splat(BIN_SIDE as i32 - 1));
+            .clamp(IVec2::ZERO, self.bin_size.as_ivec2() - IVec2::ONE);
         let mut f = dry();
         let mut best = f32::INFINITY;
-        for &i in &self.bins[bin.y as usize * BIN_SIDE + bin.x as usize] {
+        for &i in &self.bins[bin.y as usize * self.bin_size.x as usize + bin.x as usize] {
             let s = self.segments[i];
             let d = s.b.p - s.a.p;
             let t = ((p - s.a.p).dot(d) / d.length_squared()).clamp(0., 1.);
@@ -1105,7 +1265,7 @@ mod tests {
                     assert!((g.water(left).along - g.water(right).along).abs() < 0.1);
                 }
                 g.hydrology.retain(&BTreeSet::from([members[3]]));
-                assert_eq!(g.hydrology.len(), 1);
+                assert_eq!(g.hydrology.len(), 2);
                 assert!(Arc::ptr_eq(&plan, &g.hydrology.get(owner).unwrap()));
                 g.hydrology.retain(&BTreeSet::new());
                 g.hydrology.prepare(&g, members[3]);
